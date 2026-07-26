@@ -14,27 +14,29 @@ import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 /// SKELETON — state, signatures, events, and errors only. No function bodies yet; each
 /// function is implemented one at a time with its tests (see plans/02-seller-bond.md).
 contract SellerBond {
-    // ---------------------------------------------------------------- state
-
-    IERC20 public immutable usdc;
-    IIdentityRegistry public immutable identityRegistry;
-    /// @notice The only address allowed to reserve, release, or slash bond. Set once at
-    /// construction, never mutable — nothing else can ever drain a seller's stake.
-    address public immutable jobEscrow;
-
-    address public owner;
-    /// @notice Applied to new withdrawal requests only; each request snapshots an absolute
-    /// unlockTime, so changing this never retroactively affects an in-flight request.
-    uint64 public withdrawalTimelock = 3 days;
+    // ----------------------------------------------------------------- types
 
     struct WithdrawalRequest {
         uint256 amount;
         uint64 unlockTime;
     }
 
+    // ---------------------------------------------------------------- state
+
+    IERC20 public immutable USDC;
+    IIdentityRegistry public immutable IDENTITY_REGISTRY;
+    /// @notice The only address allowed to reserve, release, or slash bond. Set once at
+    /// construction, never mutable — nothing else can ever drain a seller's stake.
+    address public immutable JOB_ESCROW;
+
+    address public owner;
+    /// @notice Applied to new withdrawal requests only; each request snapshots an absolute
+    /// unlockTime, so changing this never retroactively affects an in-flight request.
+    uint64 public withdrawalTimelock = 3 days;
+
     /// agentId => gross USDC posted
     mapping(uint256 => uint256) public bondBalance;
-    /// agentId => sum locked by active/disputed jobs (moved only by jobEscrow)
+    /// agentId => sum locked by active/disputed jobs (moved only by JOB_ESCROW)
     mapping(uint256 => uint256) public reserved;
     /// agentId => at most one in-flight timelocked withdrawal
     mapping(uint256 => WithdrawalRequest) public pendingWithdrawal;
@@ -64,7 +66,7 @@ contract SellerBond {
     // ------------------------------------------------------------- modifiers
 
     modifier onlyJobEscrow() {
-        // TODO: revert NotJobEscrow unless msg.sender == jobEscrow
+        // TODO: revert NotJobEscrow unless msg.sender == JOB_ESCROW
         _;
     }
 
@@ -76,9 +78,9 @@ contract SellerBond {
     // ----------------------------------------------------------- constructor
 
     constructor(address usdc_, address identityRegistry_, address jobEscrow_) {
-        usdc = IERC20(usdc_);
-        identityRegistry = IIdentityRegistry(identityRegistry_);
-        jobEscrow = jobEscrow_;
+        USDC = IERC20(usdc_);
+        IDENTITY_REGISTRY = IIdentityRegistry(identityRegistry_);
+        JOB_ESCROW = jobEscrow_;
         owner = msg.sender;
     }
 
