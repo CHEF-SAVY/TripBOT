@@ -46,10 +46,13 @@ baseline, period.** If we later add an LLM judgment layer for the demo, the deci
 - [ ] Sanity-check the USDC contract's ABI on Arcscan behaves as plain ERC20 —
       `balanceOf`/`transfer` already confirmed working via the faucet + payment flow;
       `approve`/`transferFrom` (what `createJob`/`deposit` actually need) still untested.
-- [x] `git init` this repo. *(2026-07-26 — root repo tracks docs + plans; `arc-nanopayments/`
-      and `contracts/` are separate nested git repos, ignored at root for now — how to
-      compose them into the single public hackathon repo (submodules vs. flattening) is an
-      open decision to settle before the first push)*
+- [x] `git init` this repo. *(2026-07-26 — root repo tracks docs + plans, one commit per
+      plan file per the project owner's instruction)*
+- [x] Flatten into a single repo. *(2026-07-26, owner's decision — `arc-nanopayments/` and
+      `contracts/` de-gitted and committed into the root repo: fork imported as a pristine
+      upstream snapshot with the two baseline fixes re-applied on top as their own commits;
+      Foundry libs vendored (de-submoduled) so one clone builds without `--recursive`.
+      Nothing pushed to GitHub yet)*
 
 ## Phase 1 — `SellerBond.sol`
 Plan: [`02-seller-bond.md`](02-seller-bond.md). Tests: [`05-testing.md`](05-testing.md).
