@@ -41,11 +41,18 @@ baseline, period.** If we later add an LLM judgment layer for the demo, the deci
 - [x] `forge init` a `contracts/` Foundry project alongside the fork. *(2026-07-26 —
       forge-std v1.16.2, boilerplate removed, `arc_testnet` RPC in foundry.toml)*
 - [x] Install OpenZeppelin + forge-std. *(OpenZeppelin v5.6.1)*
-- [ ] Register buyer/seller `agentId`s on the Identity Registry — Arc has a dedicated
-      tutorial: `docs.arc.io/arc/tutorials/register-your-first-ai-agent`.
-- [ ] Sanity-check the USDC contract's ABI on Arcscan behaves as plain ERC20 —
-      `balanceOf`/`transfer` already confirmed working via the faucet + payment flow;
-      `approve`/`transferFrom` (what `createJob`/`deposit` actually need) still untested.
+- [x] Register buyer/seller `agentId`s on the Identity Registry. *(2026-07-26 — buyer
+      `agentId 851888` (tx `0xd3ab8669…`), seller `agentId 851889` (tx `0x3d70e969…`);
+      `ownerOf` verified for both; IDs recorded in the gitignored `.env.local`. Real ABI
+      pulled from Arcscan first: impl `IdentityRegistryUpgradeable` at `0x7274e874…`, three
+      `register()` overloads — used `register(string agentURI)`)*
+- [x] Sanity-check USDC behaves as plain ERC20. *(2026-07-26 — `approve` → `allowance` →
+      `transferFrom` → allowance consumed to 0, balance credited: exactly the calls
+      `SellerBond.deposit`/`JobEscrow.createJob` rely on. One Arc-specific subtlety for
+      contract/backend design: gas is paid from the same USDC balance being transferred, so
+      "transfer my whole balance" transactions can fail — never assume balance == spendable)*
+
+**Phase 0 complete (2026-07-26).**
 - [x] `git init` this repo. *(2026-07-26 — root repo tracks docs + plans, one commit per
       plan file per the project owner's instruction)*
 - [x] Flatten into a single repo. *(2026-07-26, owner's decision — `arc-nanopayments/` and
