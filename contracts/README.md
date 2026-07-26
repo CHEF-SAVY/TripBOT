@@ -1,66 +1,43 @@
-## Foundry
+# Tripwire contracts
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+Foundry project for Tripwire's two contracts:
 
-Foundry consists of:
+- **`SellerBond.sol`** — slashable USDC stake keyed by ERC-8004 agentId. Sellers post bond
+  before taking jobs; bond is reserved per job, and a slash can only ever consume what was
+  reserved for the job being resolved.
+- **`JobEscrow.sol`** *(upcoming)* — one job = one escrowed payment: release on buyer
+  approval, dispute with arbiter resolution backed by the seller's bond, timeout
+  auto-release so an absent buyer can't grief a seller.
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+## Commands
 
-## Documentation
-
-https://book.getfoundry.sh/
-
-## Usage
-
-### Build
-
-```shell
-$ forge build
+```bash
+forge build            # compile
+forge test             # run the unit suite
+forge fmt              # format (CI enforces forge fmt --check)
 ```
 
-### Test
+Fork tests against live Arc testnet registries (pre-deploy gate):
 
-```shell
-$ forge test
+```bash
+forge test --match-contract ArcForkIntegration --fork-url https://rpc.testnet.arc.network
 ```
 
-### Format
+## Layout
 
-```shell
-$ forge fmt
+```
+src/                 — contracts
+src/interfaces/      — minimal interfaces to external systems (ERC-8004 registries),
+                       signatures taken from the verified ABIs on Arc testnet
+test/                — unit tests (mirrors src/), mocks under test/mocks/
+script/              — deploy scripts
+lib/                 — vendored dependencies (forge-std, OpenZeppelin) — committed so a
+                       plain clone builds without submodule flags
 ```
 
-### Gas Snapshots
+## Network
 
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+Arc testnet — chain ID `5042002`, RPC `https://rpc.testnet.arc.network` (configured as
+`arc_testnet` in `foundry.toml`). USDC is the native gas token, with an ERC-20 interface at
+`0x3600000000000000000000000000000000000000`. Deployed contract addresses will be recorded
+here after deployment.

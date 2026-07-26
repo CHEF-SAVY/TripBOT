@@ -51,7 +51,6 @@ Paymaster/App Kits where relevant.
   since Arc's native gas token is already USDC. **App Kits** is an optional stretch item, not
   load-bearing for the MVP.
 
-Full product-by-product mapping, with sources, is in [`IMPLEMENTATION_NOTES.md`](IMPLEMENTATION_NOTES.md).
 
 ## Architecture
 
@@ -97,9 +96,8 @@ sequenceDiagram
     end
 ```
 
-Full contract-level design (state, functions, invariants) is in
-[`plans/02-seller-bond.md`](plans/02-seller-bond.md) and
-[`plans/03-job-escrow.md`](plans/03-job-escrow.md).
+The contracts live in [`contracts/src/`](contracts/src/) — a Foundry project; see
+[`contracts/README.md`](contracts/README.md) for build and test commands.
 
 ## Honest disclosures
 
@@ -111,25 +109,26 @@ Full contract-level design (state, functions, invariants) is in
   underlying "agents only hold USDC" requirement is already satisfied without it.
 - **Circle Contracts (the no-code deploy platform) isn't used** — this project deploys via
   Foundry instead, a deliberate choice for a reproducible local dev/test loop while learning
-  Solidity; see `IMPLEMENTATION_NOTES.md` §6 for the tradeoff.
+  Solidity.
 
 ## Status
 
-**Design and research phase complete, implementation not yet started.** Two contracts,
-`SellerBond.sol` and `JobEscrow.sol`, are fully designed but not yet written. See
-[`plans/`](plans/) for the modular, phase-by-phase build plan — read
-[`plans/README.md`](plans/README.md) first, then
-[`plans/06-build-sequence.md`](plans/06-build-sequence.md) for exactly where things stand and
-what's next.
+**Phase 0 complete; contracts in progress.** The baseline agent-to-agent x402 payment flow
+is confirmed working end-to-end on Arc testnet (including two upstream fixes — see the
+commit history), buyer and seller agents are registered on the ERC-8004 Identity Registry,
+and `SellerBond.sol` is being implemented incrementally on its own branch. Development
+follows a branch-per-component workflow: each component is built on its own branch and
+merged only when its tests are green.
 
 ## Repo layout
 
 ```
-CLAUDE.md               — original hackathon spec / project instructions
-README.md               — this file
-PROJECT_OVERVIEW.md      — pitch-level summary (track fit, product map, demo plan)
-IMPLEMENTATION_NOTES.md  — sourced deep-dive: how every Arc/Circle product plugs in, and why
-plans/                   — modular, phase-by-phase build plan (start here to implement)
+README.md            — this file
+LICENSE              — Apache-2.0 (inherits from the included Circle sample code)
+.github/workflows/   — CI: forge build/test + lint + typecheck, on every branch
+arc-nanopayments/    — seller app (Next.js + x402 + Supabase) and buyer agent,
+                       based on circlefin/arc-nanopayments
+contracts/           — Foundry project: SellerBond.sol + JobEscrow.sol (in progress)
 ```
 
 ## Reference links
