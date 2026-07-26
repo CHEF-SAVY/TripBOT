@@ -1,0 +1,6 @@
+# nested git repos — composition into the public repo is decided before first push
+arc-nanopayments/
+contracts/
+
+# local claude settings
+.claude/
