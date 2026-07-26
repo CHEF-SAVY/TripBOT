@@ -50,3 +50,21 @@ testnet before writing a line of Solidity.
   been built.
 - **Nothing gets committed/pushed until the relevant plan file is confirmed.** These plans are
   the checkpoint gate the project owner asked for before code lands in git history.
+- **One branch per plan (added 2026-07-26).** Every plan that produces code is implemented on
+  its own branch, named after the plan file, and merged into `main` with `--no-ff` only when
+  its work is done and its tests are green. That keeps `main` always-working and makes bug
+  hunting clean: `git log --first-parent main` reads as one merge per plan, so a regression
+  points straight at the plan that introduced it, and `git bisect` can then dig inside just
+  that branch's commits.
+  - `phase-0-baseline` — remaining Phase 0 verification work (agent registration, USDC
+    `approve`/`transferFrom` check)
+  - `plan-02-seller-bond` — `SellerBond.sol` + its unit tests
+  - `plan-03-job-escrow` — `JobEscrow.sol` + its unit tests + the fork test
+  - `plan-04-backend-integration` — the buyer/seller rewiring
+  - `plan-07-demo-deployment` — deploy scripts + demo `cast` scripts
+  - Plans 01, 05, 06, 08 don't get branches: 01/08 are reference docs, 06 is the progress
+    tracker (its checkbox updates ride along on whichever branch did the work), and 05's
+    tests are written alongside the contracts on the 02/03 branches, not as a separate
+    effort.
+  - Edits to the plan documents themselves go straight to `main` — branching a text edit
+    adds ceremony without debugging value.
