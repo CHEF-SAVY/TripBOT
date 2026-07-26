@@ -52,7 +52,10 @@ function buildPaymentRequirements(price: string) {
     asset: ARC_TESTNET_USDC,
     amount: amount.toString(),
     payTo: sellerAddress,
-    maxTimeoutSeconds: 345600,
+    // Must exceed the Gateway Wallet's on-chain withdrawalDelay (1209600s = 14d on Arc
+    // testnet), or Circle's facilitator rejects with authorization_validity_too_short.
+    // The repo's original 345600 (4d) predates that requirement. 15d leaves margin.
+    maxTimeoutSeconds: 1296000,
     extra: {
       name: "GatewayWalletBatched",
       version: "1",
