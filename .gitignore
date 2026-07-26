@@ -1,5 +1,4 @@
-# nested git repos — composition into the public repo is decided before first push
-arc-nanopayments/
+# contracts/ nested git repo — flattened before first push
 contracts/
 
 # local claude settings
