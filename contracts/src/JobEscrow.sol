@@ -176,24 +176,74 @@ contract JobEscrow {
     /// Reverts if already set — this pointer is meant to be immutable in practice, just not
     /// in the Solidity keyword sense (it can't be, since it isn't known at construction).
     function setSellerBond(address sellerBond_) external onlyOwner {
-        // TODO
+        if (address(sellerBond) != address(0)) revert SellerBondAlreadySet();
+        sellerBond = ISellerBond(sellerBond_);
+        emit SellerBondSet(sellerBond_);
     }
 
     /// @notice Buyer opens a job: validates amount/deadline, reserves the seller's bond,
     /// pulls `amount` USDC into escrow. Reverts via SellerBond.reserve() if the seller's free
     /// bond can't cover minBondRatioBps of `amount` — no duplicate ratio check here,
     /// SellerBond is the source of truth for its own balances.
+    /// @dev `validationRequestHash` is stored on the job but not yet checked against the
+    /// Validation Registry — that verification is Phase 3 (validationRegistryEnabled has no
+    /// effect until then). `IDENTITY_REGISTRY.ownerOf` reverting for an unregistered
+    /// `sellerAgentId` doubles as the existence check, same pattern as SellerBond.deposit.
     function createJob(uint256 sellerAgentId, uint256 amount, uint64 completionDeadline, bytes32 validationRequestHash)
         external
         returns (uint256 jobId)
     {
-        // TODO
+        if (amount == 0) revert ZeroAmount();
+        if (completionDeadline <= block.timestamp) revert DeadlineNotInFuture(completionDeadline);
+        if (address(sellerBond) == address(0)) revert SellerBondNotSet();
+
+        // Snapshotted now, not re-read at payout — see the Job struct's sellerPayoutAddress
+        // comment for why a buyer's committed counterparty must survive a mid-job NFT
+        // transfer unchanged.
+        address sellerPayoutAddress = IDENTITY_REGISTRY.ownerOf(sellerAgentId);
+
+        // Fixed for this job's lifetime (invariant 1) — the only amount ever reserved,
+        // released, or slashed for it, regardless of later minBondRatioBps changes.
+        uint256 reservedBond = (amount * minBondRatioBps) / 10_000;
+
+        jobId = nextJobId++;
+        jobs[jobId] = Job({
+            buyer: msg.sender,
+            sellerAgentId: sellerAgentId,
+            sellerPayoutAddress: sellerPayoutAddress,
+            amount: amount,
+            reservedBond: reservedBond,
+            completionDeadline: completionDeadline,
+            status: JobStatus.Active,
+            validationRequestHash: validationRequestHash,
+            evidenceHash: bytes32(0)
+        });
+
+        emit JobCreated(jobId, msg.sender, sellerAgentId, amount, reservedBond, completionDeadline);
+
+        // Interactions last. If the seller's free bond can't cover reservedBond,
+        // sellerBond.reserve() reverts and unwinds the job creation atomically — no separate
+        // ratio check needed here, SellerBond is the source of truth for its own balances.
+        sellerBond.reserve(sellerAgentId, reservedBond);
+        USDC.safeTransferFrom(msg.sender, address(this), amount);
     }
 
     /// @notice Buyer accepts delivery: pays the seller in full, releases the bond
-    /// reservation. Only callable by the job's buyer while Active.
+    /// reservation. Only callable by the job's buyer, while Active, and only up to
+    /// completionDeadline + responseWindow — past that point only claimTimeout applies
+    /// (invariant 4: the two windows are mutually exclusive by construction).
     function release(uint256 jobId) external onlyBuyer(jobId) {
-        // TODO
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Active) revert JobNotActive(jobId, job.status);
+
+        uint64 claimableAfter = job.completionDeadline + responseWindow;
+        if (block.timestamp >= claimableAfter) revert ResponseWindowElapsed(jobId, claimableAfter);
+
+        job.status = JobStatus.Released;
+        emit JobReleased(jobId);
+
+        sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+        USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
     }
 
     /// @notice Buyer disputes instead of releasing: records evidenceHash on-chain (the hash,
