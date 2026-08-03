@@ -1,4 +1,4 @@
-import { createPublicClient, http, type WalletClient } from "viem";
+import { createPublicClient, http, recoverMessageAddress, type WalletClient } from "viem";
 import { arcTestnet } from "viem/chains";
 
 const ARC_TESTNET_RPC = "https://rpc.testnet.arc.network";
@@ -190,4 +190,29 @@ export async function disputeJob(
   const txHash = await walletClient.writeContract(request);
   await publicClient.waitForTransactionReceipt({ hash: txHash });
   return txHash;
+}
+
+/**
+ * The message a buyer signs to redeem a job's content, and a seller checks against
+ * `job.buyer`. This is the actual authentication step: on its own, a jobId only proves
+ * *some* Active job exists with the right seller/amount — anyone who can see (or
+ * simply guess, since jobIds are sequential) a valid jobId could otherwise redeem
+ * someone else's paid delivery. Signing binds the request to the wallet that actually
+ * paid, the same role the old x402 payment-signature header used to serve.
+ */
+function jobIdMessage(jobId: bigint): string {
+  return `Tripwire:job:${jobId}`;
+}
+
+/** Buyer-side: sign proof that this wallet is redeeming `jobId`. */
+export async function signJobId(walletClient: WalletClient, jobId: bigint): Promise<`0x${string}`> {
+  if (!walletClient.account) {
+    throw new Error("signJobId requires a walletClient with an account");
+  }
+  return walletClient.signMessage({ account: walletClient.account, message: jobIdMessage(jobId) });
+}
+
+/** Seller-side: recovers the address that produced a signJobId() signature. */
+export async function recoverJobIdSigner(jobId: bigint, signature: `0x${string}`): Promise<`0x${string}`> {
+  return recoverMessageAddress({ message: jobIdMessage(jobId), signature });
 }

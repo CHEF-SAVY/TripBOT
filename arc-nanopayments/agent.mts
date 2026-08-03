@@ -1,7 +1,7 @@
 import { createWalletClient, createPublicClient, http, erc20Abi, parseUnits, keccak256, toBytes } from "viem";
 import { arcTestnet } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
-import { createJob, releaseJob, disputeJob } from "./lib/jobEscrow.ts";
+import { createJob, releaseJob, disputeJob, signJobId } from "./lib/jobEscrow.ts";
 
 // --- CLI args ---
 // One job, start to finish, per run — matches the two-recordable-runs demo script
@@ -109,11 +109,15 @@ const { jobId, txHash: createTxHash } = await createJob(walletClient, quote.jobE
 });
 console.log(`Job ${jobId} created (tx ${createTxHash})`);
 
-// --- 4. Retry, presenting the jobId ---
+// --- 4. Retry, presenting the jobId and proof we're its buyer ---
+// The signature is what actually authenticates this request — jobId alone is a public,
+// sequential, guessable number, so without it anyone who saw or guessed a valid jobId
+// could redeem someone else's paid delivery.
 console.log("Retrying with jobId...");
+const jobSignature = await signJobId(walletClient, jobId);
 const deliveryRes = await fetch(url, {
   ...requestInit(),
-  headers: { ...requestInit().headers, "x-job-id": jobId.toString() },
+  headers: { ...requestInit().headers, "x-job-id": jobId.toString(), "x-job-signature": jobSignature },
 });
 if (!deliveryRes.ok) {
   console.error(`Delivery request failed: ${deliveryRes.status} ${await deliveryRes.text()}`);
