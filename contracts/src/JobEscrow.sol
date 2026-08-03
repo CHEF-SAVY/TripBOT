@@ -46,6 +46,14 @@ contract JobEscrow {
         // job; no recomputation later, no partial-slash fallback needed.
         uint256 reservedBond;
         uint64 completionDeadline;
+        // completionDeadline + responseWindow, snapshotted at createJob() time — same
+        // rationale as reservedBond above, and the same pattern SellerBond's
+        // withdrawalTimelock already uses for pendingWithdrawal.unlockTime: a later
+        // owner change to the global responseWindow (shortened for a demo, say) must
+        // never retroactively strip a buyer's remaining time to release()/dispute(), or
+        // hand a seller more/less claimTimeout protection than they agreed to when the
+        // job was created.
+        uint64 responseDeadline;
         JobStatus status;
         // Hash of the seller's ERC-8004 validationRequest for this job, checked against the
         // Validation Registry in Phase 3. Zero until that wiring lands.
@@ -84,10 +92,32 @@ contract JobEscrow {
     // the spec's starting default). Owner-settable, same category as SellerBond's
     // withdrawalTimelock.
     uint256 public minBondRatioBps = 2000;
+    // Hard ceiling on minBondRatioBps (10_000 = 100%): bounds a careless or compromised owner
+    // from requiring more collateral than a job is even worth, which would otherwise brick
+    // createJob for every future job. No minimum — 0% is a legitimate (if risky) demo/testing
+    // configuration: createJob/release/resolveDispute/claimTimeout all guard their SellerBond
+    // calls behind `reservedBond > 0`, so a 0%-ratio job runs its full lifecycle without ever
+    // touching SellerBond (which would otherwise reject the zero-amount calls) — same
+    // reasoning as SellerBond's MAX_WITHDRAWAL_TIMELOCK having no floor.
+    uint256 public constant MAX_MIN_BOND_RATIO_BPS = 10_000;
     // Dispute window and timeout grace period, merged into one owner-settable duration: buyer
     // can release()/dispute() any time up to completionDeadline + responseWindow; after that,
     // anyone can claimTimeout().
     uint64 public responseWindow = 48 hours;
+    // Mirrors SellerBond.MAX_WITHDRAWAL_TIMELOCK exactly, same rationale: bounds what a
+    // compromised owner key can freeze (a century-long window would make claimTimeout
+    // meaningless), no minimum so a demo recording can shorten it to near-zero.
+    uint64 public constant MAX_RESPONSE_WINDOW = 30 days;
+    // Hard ceiling on how far into the future a job's completionDeadline may be set, checked
+    // in createJob. Two independent reasons this exists: (1) it bounds
+    // completionDeadline + responseWindow (both uint64) well clear of type(uint64).max, so
+    // that sum can never overflow and permanently lock a job's escrowed funds and reserved
+    // bond with no path out; (2) a "no real deadline" sentinel like type(uint64).max — a
+    // pattern this very codebase's own tests use for USDC allowances
+    // (`approve(..., type(uint256).max)`) — would otherwise be a plausible integration
+    // mistake that triggers exactly that overflow. Not owner-settable: this is a structural
+    // safety bound, not a risk/business parameter like minBondRatioBps or responseWindow.
+    uint64 public constant MAX_JOB_DURATION = 365 days;
 
     mapping(uint256 => Job) public jobs;
     uint256 public nextJobId;
@@ -119,6 +149,7 @@ contract JobEscrow {
     error SellerBondNotSet();
     error ZeroAmount();
     error DeadlineNotInFuture(uint64 completionDeadline);
+    error DeadlineTooFar(uint64 completionDeadline, uint64 maxCompletionDeadline);
     // Doubles as the "job doesn't exist" check: a nonexistent jobId's status is JobStatus.None,
     // which is never JobStatus.Active — same "revert doubles as existence check" pattern used
     // throughout SellerBond.
@@ -126,6 +157,8 @@ contract JobEscrow {
     error JobNotDisputed(uint256 jobId, JobStatus status);
     error ResponseWindowElapsed(uint256 jobId, uint64 claimableAfter);
     error ResponseWindowNotElapsed(uint256 jobId, uint64 claimableAfter);
+    error MinBondRatioTooHigh(uint256 requested, uint256 max);
+    error ResponseWindowTooLong(uint64 requested, uint64 max);
 
     // ------------------------------------------------------------- modifiers
 
@@ -195,6 +228,15 @@ contract JobEscrow {
     {
         if (amount == 0) revert ZeroAmount();
         if (completionDeadline <= block.timestamp) revert DeadlineNotInFuture(completionDeadline);
+        // Upper-bounds completionDeadline so completionDeadline + responseWindow can never
+        // overflow uint64 below (see MAX_JOB_DURATION) — without this, a deadline near
+        // type(uint64).max would permanently lock this job's escrow and reserved bond, since
+        // every exit path (release/dispute/claimTimeout, and transitively resolveDispute)
+        // computes that same sum.
+        uint64 maxCompletionDeadline = uint64(block.timestamp) + MAX_JOB_DURATION;
+        if (completionDeadline > maxCompletionDeadline) {
+            revert DeadlineTooFar(completionDeadline, maxCompletionDeadline);
+        }
         if (address(sellerBond) == address(0)) revert SellerBondNotSet();
 
         // Snapshotted now, not re-read at payout — see the Job struct's sellerPayoutAddress
@@ -203,7 +245,9 @@ contract JobEscrow {
         address sellerPayoutAddress = IDENTITY_REGISTRY.ownerOf(sellerAgentId);
 
         // Fixed for this job's lifetime (invariant 1) — the only amount ever reserved,
-        // released, or slashed for it, regardless of later minBondRatioBps changes.
+        // released, or slashed for it, regardless of later minBondRatioBps changes. Can be
+        // zero when minBondRatioBps is 0 (see the guard below) — a deliberately supported
+        // demo/testing configuration, not an edge case to reject.
         uint256 reservedBond = (amount * minBondRatioBps) / 10_000;
 
         jobId = nextJobId++;
@@ -214,6 +258,9 @@ contract JobEscrow {
             amount: amount,
             reservedBond: reservedBond,
             completionDeadline: completionDeadline,
+            // Snapshotted once, here — see the Job struct's responseDeadline comment for why
+            // a later change to the global responseWindow must never retroactively move this.
+            responseDeadline: completionDeadline + responseWindow,
             status: JobStatus.Active,
             validationRequestHash: validationRequestHash,
             evidenceHash: bytes32(0)
@@ -224,62 +271,123 @@ contract JobEscrow {
         // Interactions last. If the seller's free bond can't cover reservedBond,
         // sellerBond.reserve() reverts and unwinds the job creation atomically — no separate
         // ratio check needed here, SellerBond is the source of truth for its own balances.
-        sellerBond.reserve(sellerAgentId, reservedBond);
+        // Skipped entirely when reservedBond is zero (minBondRatioBps == 0): SellerBond
+        // rejects zero-amount calls, and there is genuinely nothing to reserve.
+        if (reservedBond > 0) {
+            sellerBond.reserve(sellerAgentId, reservedBond);
+        }
         USDC.safeTransferFrom(msg.sender, address(this), amount);
     }
 
     /// @notice Buyer accepts delivery: pays the seller in full, releases the bond
-    /// reservation. Only callable by the job's buyer, while Active, and only up to
-    /// completionDeadline + responseWindow — past that point only claimTimeout applies
+    /// reservation. Only callable by the job's buyer, while Active, and only up to the
+    /// job's snapshotted responseDeadline — past that point only claimTimeout applies
     /// (invariant 4: the two windows are mutually exclusive by construction).
     function release(uint256 jobId) external onlyBuyer(jobId) {
         Job storage job = jobs[jobId];
         if (job.status != JobStatus.Active) revert JobNotActive(jobId, job.status);
-
-        uint64 claimableAfter = job.completionDeadline + responseWindow;
-        if (block.timestamp >= claimableAfter) revert ResponseWindowElapsed(jobId, claimableAfter);
+        if (block.timestamp >= job.responseDeadline) {
+            revert ResponseWindowElapsed(jobId, job.responseDeadline);
+        }
 
         job.status = JobStatus.Released;
         emit JobReleased(jobId);
 
-        sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+        // Skipped when reservedBond is zero (minBondRatioBps was 0 at creation) — nothing
+        // was ever reserved, and SellerBond rejects zero-amount calls.
+        if (job.reservedBond > 0) {
+            sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+        }
         USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
     }
 
     /// @notice Buyer disputes instead of releasing: records evidenceHash on-chain (the hash,
     /// not raw evidence) and flips status to Disputed. No fund movement yet — that only
-    /// happens at resolveDispute. Only callable by the job's buyer, before
-    /// completionDeadline + responseWindow.
+    /// happens at resolveDispute. Only callable by the job's buyer, while Active, and only up
+    /// to the job's snapshotted responseDeadline — same window release() enforces, so the two
+    /// buyer-facing choices share one deadline.
     function dispute(uint256 jobId, bytes32 evidenceHash) external onlyBuyer(jobId) {
-        // TODO
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Active) revert JobNotActive(jobId, job.status);
+        if (block.timestamp >= job.responseDeadline) {
+            revert ResponseWindowElapsed(jobId, job.responseDeadline);
+        }
+
+        job.status = JobStatus.Disputed;
+        job.evidenceHash = evidenceHash;
+        emit JobDisputed(jobId, evidenceHash);
     }
 
     /// @notice Arbiter resolves a dispute. sellerAtFault=true slashes the reserved bond to
     /// the buyer and separately refunds the escrowed amount; sellerAtFault=false pays the
     /// seller as if released normally. MVP: single arbiter address, disclosed as
-    /// centralized-for-now.
+    /// centralized-for-now. Unlike Active jobs there is no timeout rescue once Disputed — a
+    /// disallowed dispute sits until the arbiter acts (see plans/08-disclosures.md).
     function resolveDispute(uint256 jobId, bool sellerAtFault) external onlyArbiter {
-        // TODO
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Disputed) revert JobNotDisputed(jobId, job.status);
+
+        job.status = JobStatus.Resolved;
+        emit JobResolved(jobId, sellerAtFault);
+
+        if (sellerAtFault) {
+            // Buyer receives two separate payments: the slashed bond straight from
+            // SellerBond, plus the escrowed amount refunded from JobEscrow's own
+            // holdings — real compensation on top of just getting their own money back.
+            // Skipped when reservedBond is zero — see release()'s equivalent comment.
+            if (job.reservedBond > 0) {
+                sellerBond.slash(job.sellerAgentId, job.reservedBond, job.buyer);
+            }
+            USDC.safeTransfer(job.buyer, job.amount);
+        } else {
+            // The dispute didn't find the seller at fault, so they're paid exactly as if
+            // the buyer had called release() — same two calls, same amounts.
+            if (job.reservedBond > 0) {
+                sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+            }
+            USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
+        }
     }
 
-    /// @notice Anyone may trigger auto-release to the seller once
-    /// completionDeadline + responseWindow has passed with the buyer having done nothing —
-    /// without this a buyer could grief a seller forever by simply not responding.
+    /// @notice Anyone may trigger auto-release to the seller once the job's snapshotted
+    /// responseDeadline has passed with the buyer having done nothing — without this a buyer
+    /// could grief a seller forever by simply not responding.
     function claimTimeout(uint256 jobId) external {
-        // TODO
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Active) revert JobNotActive(jobId, job.status);
+        if (block.timestamp < job.responseDeadline) {
+            revert ResponseWindowNotElapsed(jobId, job.responseDeadline);
+        }
+
+        job.status = JobStatus.TimedOut;
+        emit JobTimedOut(jobId);
+
+        if (job.reservedBond > 0) {
+            sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+        }
+        USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
     }
 
     /// @notice Update the risk parameter controlling how much bond a job requires, as a
     /// fraction of job amount in basis points. Applies to jobs created after the change —
-    /// already-active jobs keep their snapshotted reservedBond (invariant 1).
+    /// already-active jobs keep their snapshotted reservedBond (invariant 1). Capped at
+    /// MAX_MIN_BOND_RATIO_BPS.
     function setMinBondRatioBps(uint256 newRatioBps) external onlyOwner {
-        // TODO
+        if (newRatioBps > MAX_MIN_BOND_RATIO_BPS) {
+            revert MinBondRatioTooHigh(newRatioBps, MAX_MIN_BOND_RATIO_BPS);
+        }
+        emit MinBondRatioBpsUpdated(minBondRatioBps, newRatioBps);
+        minBondRatioBps = newRatioBps;
     }
 
     /// @notice Update the combined dispute window / timeout grace period. Applies to jobs
     /// created after the change — an already-active job's deadline math was fixed at its own
-    /// completionDeadline, set at creation time.
+    /// completionDeadline, set at creation time. Capped at MAX_RESPONSE_WINDOW.
     function setResponseWindow(uint64 newWindow) external onlyOwner {
-        // TODO
+        if (newWindow > MAX_RESPONSE_WINDOW) {
+            revert ResponseWindowTooLong(newWindow, MAX_RESPONSE_WINDOW);
+        }
+        emit ResponseWindowUpdated(responseWindow, newWindow);
+        responseWindow = newWindow;
     }
 }
