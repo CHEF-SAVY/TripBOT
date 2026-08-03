@@ -80,7 +80,7 @@ contract SellerBond {
     // ------------------------------------------------------------- modifiers
 
     modifier onlyJobEscrow() {
-        // TODO: revert NotJobEscrow unless msg.sender == JOB_ESCROW
+        _checkJobEscrow();
         _;
     }
 
@@ -96,6 +96,13 @@ contract SellerBond {
     /// duplicated into every use site's bytecode.
     function _checkOwner() internal view {
         if (msg.sender != owner) revert NotOwner();
+    }
+
+    /// @dev See onlyJobEscrow. JOB_ESCROW is immutable and set once at construction, so
+    /// this is the only gate that ever needs checking — there's no owner-mutable backdoor
+    /// that could let anything else reserve, release, or slash a seller's bond.
+    function _checkJobEscrow() internal view {
+        if (msg.sender != JOB_ESCROW) revert NotJobEscrow();
     }
 
     // ----------------------------------------------------------- constructor
@@ -226,20 +233,57 @@ contract SellerBond {
     }
 
     /// @notice Lock `amount` of the agent's free bond for a job. Only JobEscrow.
+    /// @dev Checked against bondOf(), which already nets out both existing reservations and
+    /// any pending withdrawal — so a seller can never have more locked against them (across
+    /// any number of concurrent jobs plus an in-flight withdrawal) than they actually posted.
+    /// This is finding 5 from the research doc: a ratio check at creation alone can't prevent
+    /// two concurrent jobs from both passing individually and then being jointly unfundable
+    /// at dispute time. Real reservation closes that gap.
     function reserve(uint256 agentId, uint256 amount) external onlyJobEscrow {
-        // TODO
+        if (amount == 0) revert ZeroAmount();
+
+        uint256 free = bondOf(agentId);
+        if (amount > free) revert InsufficientBond(agentId, amount, free);
+
+        reserved[agentId] += amount;
+        emit Reserved(agentId, amount);
     }
 
     /// @notice Unlock a previous reservation (job released / resolved in seller's favor).
+    /// @dev No token movement here — this only frees bookkeeping room. Whichever side the
+    /// funds actually end up on was already settled by `release`/`completeWithdrawal`
+    /// elsewhere; this call just tells us the job this amount was locked for is done.
     function releaseReservation(uint256 agentId, uint256 amount) external onlyJobEscrow {
-        // TODO
+        if (amount == 0) revert ZeroAmount();
+
+        uint256 currentlyReserved = reserved[agentId];
+        if (amount > currentlyReserved) {
+            revert InsufficientReserved(agentId, amount, currentlyReserved);
+        }
+
+        reserved[agentId] -= amount;
+        emit ReservationReleased(agentId, amount);
     }
 
     /// @notice Confiscate up to the agent's *reserved* bond and send it to `recipient`
     /// (the wronged buyer). Requires amount <= reserved[agentId] — a slash can never touch
     /// free bond, only what was locked for the job being resolved.
+    /// @dev Both bondBalance and reserved drop together: the stake is gone for good, not
+    /// just unreserved, so it can never be double-counted toward a later job or withdrawal.
     function slash(uint256 agentId, uint256 amount, address recipient) external onlyJobEscrow {
-        // TODO
+        if (amount == 0) revert ZeroAmount();
+
+        uint256 currentlyReserved = reserved[agentId];
+        if (amount > currentlyReserved) {
+            revert InsufficientReserved(agentId, amount, currentlyReserved);
+        }
+
+        // Effects before interactions, as everywhere else in this contract.
+        bondBalance[agentId] -= amount;
+        reserved[agentId] = currentlyReserved - amount;
+        emit Slashed(agentId, recipient, amount);
+
+        USDC.safeTransfer(recipient, amount);
     }
 
     /// @notice Free bond available to new jobs or withdrawal requests.

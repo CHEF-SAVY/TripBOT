@@ -26,6 +26,8 @@ contract SellerBondTest is Test {
     address internal jobEscrow = makeAddr("jobEscrow");
     /// Receives the agent NFT in the mid-timelock transfer scenario.
     address internal newOwner = makeAddr("newOwner");
+    /// The wronged party in a slash — stands in for JobEscrow's buyer refund path.
+    address internal buyer = makeAddr("buyer");
 
     /// Arbitrary agent id — the value itself is meaningless, only the registry mapping
     /// gives it meaning. Chosen non-tiny so it can't accidentally collide with defaults.
@@ -44,6 +46,9 @@ contract SellerBondTest is Test {
     event WithdrawalRequested(uint256 indexed agentId, uint256 amount, uint64 unlockTime);
     event WithdrawalCompleted(uint256 indexed agentId, address indexed to, uint256 amount);
     event WithdrawalTimelockUpdated(uint64 previous, uint64 current);
+    event Reserved(uint256 indexed agentId, uint256 amount);
+    event ReservationReleased(uint256 indexed agentId, uint256 amount);
+    event Slashed(uint256 indexed agentId, address indexed recipient, uint256 amount);
 
     /// Fresh state before every test: new token, new registry, new SellerBond wired to
     /// them, one registered agent owned by `seller`, who holds STAKE USDC and has already
@@ -405,5 +410,179 @@ contract SellerBondTest is Test {
         uint64 tooLong = 30 days + 1;
         vm.expectRevert(abi.encodeWithSelector(SellerBond.TimelockTooLong.selector, tooLong, uint64(30 days)));
         bond.setWithdrawalTimelock(tooLong);
+    }
+
+    // ------------------------------------------------------- reserve / releaseReservation / slash
+
+    /// Shared precondition for this section: STAKE deposited as `seller`, nothing reserved
+    /// yet. Kept separate from `_depositAndRequest` since these tests exercise the
+    /// JobEscrow-only surface, not the withdrawal one.
+    function _deposit() internal {
+        vm.prank(seller);
+        bond.deposit(AGENT_ID, STAKE);
+    }
+
+    /// Reserving moves bond from "free" to "locked" without moving any tokens — bondOf()
+    /// drops by exactly the reserved amount, the balance sheet total is untouched.
+    function test_ReserveLocksFreeBond() public {
+        _deposit();
+
+        vm.expectEmit(true, false, false, true);
+        emit Reserved(AGENT_ID, WITHDRAW);
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+
+        assertEq(bond.reserved(AGENT_ID), WITHDRAW, "reserved should track the locked amount");
+        assertEq(bond.bondOf(AGENT_ID), STAKE - WITHDRAW, "free bond should drop by the reserved amount");
+        assertEq(bond.bondBalance(AGENT_ID), STAKE, "gross balance is untouched by reservation");
+    }
+
+    /// Only JobEscrow may lock a seller's stake — nothing else, not even the owner.
+    function test_RevertWhen_ReserveByNonJobEscrow() public {
+        _deposit();
+        vm.prank(stranger);
+        vm.expectRevert(SellerBond.NotJobEscrow.selector);
+        bond.reserve(AGENT_ID, WITHDRAW);
+    }
+
+    function test_RevertWhen_ReserveZero() public {
+        _deposit();
+        vm.prank(jobEscrow);
+        vm.expectRevert(SellerBond.ZeroAmount.selector);
+        bond.reserve(AGENT_ID, 0);
+    }
+
+    /// Can't lock more than is actually free — this is the check that makes concurrent
+    /// jobs against one bond mutually honest instead of each independently passing a
+    /// ratio check and jointly overcommitting the stake.
+    function test_RevertWhen_ReserveExceedsFreeBond() public {
+        _deposit();
+        vm.prank(jobEscrow);
+        vm.expectRevert(abi.encodeWithSelector(SellerBond.InsufficientBond.selector, AGENT_ID, STAKE + 1, STAKE));
+        bond.reserve(AGENT_ID, STAKE + 1);
+    }
+
+    /// The property the reservation design exists for: bondOf() nets reservations and
+    /// pending withdrawals together, so a seller can never get double credit for the same
+    /// bond across a live job and an in-flight withdrawal request.
+    function test_ReserveRespectsAlreadyPendingWithdrawal() public {
+        vm.startPrank(seller);
+        bond.deposit(AGENT_ID, STAKE);
+        bond.requestWithdrawal(AGENT_ID, WITHDRAW); // free bond now STAKE - WITHDRAW
+        vm.stopPrank();
+
+        uint256 free = bond.bondOf(AGENT_ID);
+        vm.prank(jobEscrow);
+        vm.expectRevert(abi.encodeWithSelector(SellerBond.InsufficientBond.selector, AGENT_ID, free + 1, free));
+        bond.reserve(AGENT_ID, free + 1);
+    }
+
+    /// Releasing a reservation frees bookkeeping room without moving tokens — the mirror
+    /// image of `reserve`.
+    function test_ReleaseReservationUnlocksBond() public {
+        _deposit();
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+
+        vm.expectEmit(true, false, false, true);
+        emit ReservationReleased(AGENT_ID, WITHDRAW);
+        vm.prank(jobEscrow);
+        bond.releaseReservation(AGENT_ID, WITHDRAW);
+
+        assertEq(bond.reserved(AGENT_ID), 0, "reservation should be fully cleared");
+        assertEq(bond.bondOf(AGENT_ID), STAKE, "full stake should be free again");
+    }
+
+    function test_RevertWhen_ReleaseReservationByNonJobEscrow() public {
+        _deposit();
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+
+        vm.prank(stranger);
+        vm.expectRevert(SellerBond.NotJobEscrow.selector);
+        bond.releaseReservation(AGENT_ID, WITHDRAW);
+    }
+
+    function test_RevertWhen_ReleaseReservationZero() public {
+        vm.prank(jobEscrow);
+        vm.expectRevert(SellerBond.ZeroAmount.selector);
+        bond.releaseReservation(AGENT_ID, 0);
+    }
+
+    /// Can't release more than is actually locked — protects against a JobEscrow-side bug
+    /// silently under-flowing `reserved` into an enormous number.
+    function test_RevertWhen_ReleaseReservationExceedsReserved() public {
+        _deposit();
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+
+        vm.prank(jobEscrow);
+        vm.expectRevert(
+            abi.encodeWithSelector(SellerBond.InsufficientReserved.selector, AGENT_ID, WITHDRAW + 1, WITHDRAW)
+        );
+        bond.releaseReservation(AGENT_ID, WITHDRAW + 1);
+    }
+
+    /// The other half of the pitch: a slash actually moves USDC to the wronged buyer and
+    /// permanently removes it from the seller's stake — both the gross balance and the
+    /// reservation drop together, so the confiscated amount can never resurface.
+    function test_SlashTransfersToRecipientAndDecrementsBoth() public {
+        _deposit();
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+
+        vm.expectEmit(true, true, false, true);
+        emit Slashed(AGENT_ID, buyer, WITHDRAW);
+        vm.prank(jobEscrow);
+        bond.slash(AGENT_ID, WITHDRAW, buyer);
+
+        assertEq(usdc.balanceOf(buyer), WITHDRAW, "slashed funds should reach the wronged buyer");
+        assertEq(bond.reserved(AGENT_ID), 0, "reservation is consumed by the slash");
+        assertEq(bond.bondBalance(AGENT_ID), STAKE - WITHDRAW, "gross stake should permanently shrink");
+    }
+
+    function test_RevertWhen_SlashByNonJobEscrow() public {
+        _deposit();
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+
+        vm.prank(stranger);
+        vm.expectRevert(SellerBond.NotJobEscrow.selector);
+        bond.slash(AGENT_ID, WITHDRAW, buyer);
+    }
+
+    function test_RevertWhen_SlashZero() public {
+        vm.prank(jobEscrow);
+        vm.expectRevert(SellerBond.ZeroAmount.selector);
+        bond.slash(AGENT_ID, 0, buyer);
+    }
+
+    /// The invariant that makes reservation meaningful: a slash can never exceed what was
+    /// actually locked for the job being resolved, even though the seller's total stake
+    /// (free + reserved) is larger.
+    function test_RevertWhen_SlashExceedsReserved() public {
+        _deposit();
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+
+        vm.prank(jobEscrow);
+        vm.expectRevert(
+            abi.encodeWithSelector(SellerBond.InsufficientReserved.selector, AGENT_ID, WITHDRAW + 1, WITHDRAW)
+        );
+        bond.slash(AGENT_ID, WITHDRAW + 1, buyer);
+    }
+
+    /// Free bond, once reserved, is structurally unreachable to a withdrawal request —
+    /// bondOf() already excludes it, so there is no path by which completing a pending
+    /// withdrawal could ever dip into funds a live job is depending on.
+    function test_PendingWithdrawalNeverDipsIntoReservedBond() public {
+        _deposit();
+
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, STAKE); // lock the entire stake against a job
+
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(SellerBond.InsufficientBond.selector, AGENT_ID, 1, 0));
+        bond.requestWithdrawal(AGENT_ID, 1); // nothing free left to request
     }
 }
