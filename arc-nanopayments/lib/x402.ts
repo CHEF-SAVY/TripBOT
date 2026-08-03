@@ -16,180 +16,171 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { BatchFacilitatorClient } from "@circle-fin/x402-batching/server";
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest, NextResponse } from "next/server";
-
-// Arc Testnet contract addresses (from @circle-fin/x402-batching SDK)
-const ARC_TESTNET_NETWORK = "eip155:5042002";
-const ARC_TESTNET_USDC = "0x3600000000000000000000000000000000000000";
-const ARC_TESTNET_GATEWAY_WALLET = "0x0077777d7EBA4688BDeF3E311b846F25870A19B9";
-
-export const sellerAddress = process.env.SELLER_ADDRESS as `0x${string}`;
-
-const facilitator = new BatchFacilitatorClient();
+import { zeroHash } from "viem";
+import { getJob, JobStatus, recoverJobIdSigner } from "./jobEscrow";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!,
 );
 
-interface PaymentPayload {
-  x402Version: number;
-  resource?: { url: string; description: string; mimeType: string };
-  accepted?: Record<string, unknown>;
-  payload: Record<string, unknown>;
-  extensions?: Record<string, unknown>;
+// Fails loudly at module load rather than silently defaulting to 0n — a misconfigured
+// SELLER_AGENT_ID should be an obvious startup error, not a confusing "wrong seller"
+// rejection on every request once real jobs start hitting it.
+if (!process.env.SELLER_AGENT_ID) {
+  throw new Error("SELLER_AGENT_ID not configured");
 }
+const SELLER_AGENT_ID = BigInt(process.env.SELLER_AGENT_ID);
 
-function buildPaymentRequirements(price: string) {
-  // Parse dollar amount to USDC atomic units (6 decimals)
-  const amount = Math.round(parseFloat(price.replace("$", "")) * 1_000_000);
+const HEX_ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
+const rawJobEscrowAddress = process.env.JOB_ESCROW_ADDRESS;
+if (rawJobEscrowAddress && !HEX_ADDRESS_RE.test(rawJobEscrowAddress)) {
+  throw new Error(`JOB_ESCROW_ADDRESS is not a valid address: ${rawJobEscrowAddress}`);
+}
+const JOB_ESCROW_ADDRESS = rawJobEscrowAddress as `0x${string}` | undefined;
 
-  return {
-    scheme: "exact" as const,
-    network: ARC_TESTNET_NETWORK,
-    asset: ARC_TESTNET_USDC,
-    amount: amount.toString(),
-    payTo: sellerAddress,
-    // Must exceed the Gateway Wallet's on-chain withdrawalDelay (1209600s = 14d on Arc
-    // testnet), or Circle's facilitator rejects with authorization_validity_too_short.
-    // The repo's original 345600 (4d) predates that requirement. 15d leaves margin.
-    maxTimeoutSeconds: 1296000,
-    extra: {
-      name: "GatewayWalletBatched",
-      version: "1",
-      verifyingContract: ARC_TESTNET_GATEWAY_WALLET,
-    },
-  };
+/** Parses a "$0.001"-style price string into USDC atomic units (6 decimals). */
+function priceToAtomicUnits(price: string): bigint {
+  return BigInt(Math.round(parseFloat(price.replace("$", "")) * 1_000_000));
 }
 
 /**
- * Wraps a Next.js route handler with Circle Gateway payment verification.
+ * Wraps a Next.js route handler with JobEscrow settlement verification.
  *
- * Follows fred-mvp's approach: manually constructs payment requirements with
- * the Gateway batching `extra` field and calls BatchFacilitatorClient directly.
+ * Two-step flow, same shape x402 always had, but "payment" is now an on-chain
+ * escrowed job instead of a signed Circle Gateway authorization:
+ *
+ *  1. No jobId presented -> 402 with what's needed to call JobEscrow.createJob()
+ *     (price, sellerAgentId, requestHash, jobEscrowAddress). Plain JSON body, not the
+ *     old base64 PAYMENT-REQUIRED header — that encoding existed to satisfy x402's
+ *     signed-payload convention, which doesn't apply to a read-only job lookup.
+ *  2. jobId presented (`x-job-id` header) -> read-only view call to JobEscrow.jobs(jobId)
+ *     confirms status is Active and the seller/amount actually match this resource, and
+ *     an `x-job-signature` proves the caller actually controls job.buyer — status/
+ *     seller/amount alone only prove *some* valid job exists, not that this caller is
+ *     the one who paid for it (jobIds are sequential and freely readable, so without
+ *     this a job's content could be redeemed by anyone who saw or guessed its id, not
+ *     just its buyer). Only then does the real handler run.
  */
 export function withGateway(
   handler: (req: NextRequest) => Promise<NextResponse>,
   price: string,
   endpoint: string,
 ) {
-  const requirements = buildPaymentRequirements(price);
+  const expectedAmount = priceToAtomicUnits(price);
 
   return async (req: NextRequest) => {
-    const paymentSignature = req.headers.get("payment-signature");
-
-    // No payment — return 402 with Gateway batching payment requirements
-    if (!paymentSignature) {
-      console.log(`[x402] 402 Payment Required: ${endpoint}`);
-
-      const paymentRequired = {
-        x402Version: 2,
-        resource: {
-          url: endpoint,
-          description: `Paid resource (${price} USDC)`,
-          mimeType: "application/json",
-        },
-        accepts: [requirements],
-      };
-
-      return new NextResponse(JSON.stringify({}), {
-        status: 402,
-        headers: {
-          "Content-Type": "application/json",
-          "PAYMENT-REQUIRED": Buffer.from(
-            JSON.stringify(paymentRequired),
-          ).toString("base64"),
-        },
-      });
+    if (!JOB_ESCROW_ADDRESS) {
+      return NextResponse.json({ error: "JOB_ESCROW_ADDRESS not configured" }, { status: 500 });
     }
 
-    // Payment present — verify and settle via Circle Gateway
+    const jobIdHeader = req.headers.get("x-job-id");
+
+    // No jobId yet — buyer hasn't created a job. Tell them what to create one against.
+    if (!jobIdHeader) {
+      console.log(`[escrow] 402 Job Required: ${endpoint}`);
+      return NextResponse.json(
+        {
+          price,
+          sellerAgentId: SELLER_AGENT_ID.toString(),
+          // TODO(Phase 3): real ERC-8004 validationRequest() hash, once the Validation
+          // Registry is wired in on both sides. JobEscrow.createJob() doesn't check
+          // this field yet either, so a fake-but-real-looking hash here would just be
+          // misleading — a zero placeholder is the honest thing to send.
+          requestHash: zeroHash,
+          jobEscrowAddress: JOB_ESCROW_ADDRESS,
+        },
+        { status: 402 },
+      );
+    }
+
+    let jobId: bigint;
     try {
-      const paymentPayload: PaymentPayload = JSON.parse(
-        Buffer.from(paymentSignature, "base64").toString("utf-8"),
+      jobId = BigInt(jobIdHeader);
+    } catch {
+      return NextResponse.json({ error: "x-job-id must be a valid integer" }, { status: 400 });
+    }
+    // BigInt("-1") parses without throwing, but a negative value can't be ABI-encoded
+    // as the uint256 `jobs()` expects — catch it here with a clear 400 instead of
+    // letting it fail deep inside the RPC call below.
+    if (jobId < BigInt(0)) {
+      return NextResponse.json({ error: "x-job-id must not be negative" }, { status: 400 });
+    }
+
+    const jobSignature = req.headers.get("x-job-signature");
+    if (!jobSignature) {
+      return NextResponse.json(
+        { error: "x-job-signature is required — sign the jobId to prove you're its buyer" },
+        { status: 401 },
       );
+    }
 
-      const verifyResult = await facilitator.verify(
-        paymentPayload,
-        requirements,
+    let job;
+    try {
+      job = await getJob(JOB_ESCROW_ADDRESS, jobId);
+    } catch (err) {
+      console.error(`Failed to read job ${jobId}:`, err instanceof Error ? err.message : err);
+      return NextResponse.json({ error: "Failed to look up job" }, { status: 500 });
+    }
+
+    if (job.status === JobStatus.None) {
+      return NextResponse.json({ error: `Job ${jobId} does not exist` }, { status: 400 });
+    }
+    if (job.status !== JobStatus.Active) {
+      return NextResponse.json({ error: `Job ${jobId} is not Active (status: ${job.status})` }, { status: 400 });
+    }
+
+    let signer: `0x${string}`;
+    try {
+      signer = await recoverJobIdSigner(jobId, jobSignature as `0x${string}`);
+    } catch {
+      return NextResponse.json({ error: "x-job-signature is not a valid signature" }, { status: 400 });
+    }
+    if (signer.toLowerCase() !== job.buyer.toLowerCase()) {
+      return NextResponse.json({ error: `x-job-signature was not signed by job ${jobId}'s buyer` }, { status: 401 });
+    }
+
+    if (job.sellerAgentId !== SELLER_AGENT_ID) {
+      return NextResponse.json({ error: `Job ${jobId} was not created for this seller` }, { status: 400 });
+    }
+    // Known limitation: this only checks seller + amount, not which endpoint the job
+    // was quoted for. Today the four routes happen to have distinct prices, so this
+    // can't be exploited by accident, but nothing stops a job created against one
+    // endpoint's price from being replayed against a different endpoint charging the
+    // same amount. Binding a job to a specific endpoint is exactly what Phase 3's
+    // requestHash check (once real) is meant to close — not fixed here on purpose,
+    // since the contract side doesn't enforce it yet either.
+    if (job.amount !== expectedAmount) {
+      return NextResponse.json(
+        { error: `Job ${jobId} amount (${job.amount}) does not match the quoted price (${expectedAmount})` },
+        { status: 400 },
       );
+    }
 
-      if (!verifyResult.isValid) {
-        return NextResponse.json(
-          {
-            error: "Payment verification failed",
-            reason: verifyResult.invalidReason,
-          },
-          { status: 402 },
-        );
-      }
-
-      const settleResult = await facilitator.settle(
-        paymentPayload,
-        requirements,
-      );
-
-      if (!settleResult.success) {
-        console.error(
-          `[x402] Settlement failed for ${endpoint}: ${settleResult.errorReason}`,
-        );
-        return NextResponse.json(
-          {
-            error: "Payment settlement failed",
-            reason: settleResult.errorReason,
-          },
-          { status: 402 },
-        );
-      }
-
-      // Record payment event in Supabase
-      const amountUsdc = (
-        Number(requirements.amount) / 1e6
-      ).toString();
-      const payer = settleResult.payer ?? verifyResult.payer ?? "unknown";
-
+    try {
+      // Record the job as settled in the same store the old settlement events used, so
+      // the existing realtime dashboard keeps working off escrow jobs instead of Gateway
+      // settlements. A logging failure here must never block a delivery the buyer has
+      // already legitimately paid and authenticated for.
       const { error } = await supabase.from("payment_events").insert({
         endpoint,
-        payer,
-        amount_usdc: amountUsdc,
-        network: requirements.network,
-        gateway_tx: settleResult.transaction ?? null,
-        raw: { requirements, settleResult },
+        payer: job.buyer,
+        amount_usdc: (Number(job.amount) / 1e6).toString(),
+        network: "arc-testnet",
+        gateway_tx: null,
+        raw: { jobId: jobId.toString(), sellerAgentId: job.sellerAgentId.toString() },
       });
-
       if (error) {
         console.error("Failed to record payment event:", error.message);
       }
-
-      console.log(
-        `[x402] Payment settled: ${endpoint} — ${amountUsdc} USDC from ${payer}`,
-      );
-
-      // Call the actual route handler
-      const response = await handler(req);
-
-      // Forward settlement info to the client
-      const settleResponseHeader = Buffer.from(
-        JSON.stringify({
-          success: true,
-          transaction: settleResult.transaction,
-          network: requirements.network,
-          payer,
-        }),
-      ).toString("base64");
-
-      response.headers.set("PAYMENT-RESPONSE", settleResponseHeader);
-      return response;
-    } catch (error) {
-      const message =
-        error instanceof Error ? error.message : String(error);
-      console.error("[x402] Payment processing error:", message);
-      return NextResponse.json(
-        { error: "Payment processing error", message },
-        { status: 500 },
-      );
+    } catch (err) {
+      console.error("Failed to record payment event:", err instanceof Error ? err.message : err);
     }
+
+    console.log(`[escrow] Job ${jobId} verified Active: ${endpoint} — ${price} from ${job.buyer}`);
+
+    return handler(req);
   };
 }
