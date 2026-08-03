@@ -84,10 +84,19 @@ contract JobEscrow {
     // the spec's starting default). Owner-settable, same category as SellerBond's
     // withdrawalTimelock.
     uint256 public minBondRatioBps = 2000;
+    // Hard ceiling on minBondRatioBps (10_000 = 100%): bounds a careless or compromised owner
+    // from requiring more collateral than a job is even worth, which would otherwise brick
+    // createJob for every future job. No minimum — 0% is a legitimate (if risky) demo/testing
+    // configuration, same reasoning as SellerBond's MAX_WITHDRAWAL_TIMELOCK having no floor.
+    uint256 public constant MAX_MIN_BOND_RATIO_BPS = 10_000;
     // Dispute window and timeout grace period, merged into one owner-settable duration: buyer
     // can release()/dispute() any time up to completionDeadline + responseWindow; after that,
     // anyone can claimTimeout().
     uint64 public responseWindow = 48 hours;
+    // Mirrors SellerBond.MAX_WITHDRAWAL_TIMELOCK exactly, same rationale: bounds what a
+    // compromised owner key can freeze (a century-long window would make claimTimeout
+    // meaningless), no minimum so a demo recording can shorten it to near-zero.
+    uint64 public constant MAX_RESPONSE_WINDOW = 30 days;
 
     mapping(uint256 => Job) public jobs;
     uint256 public nextJobId;
@@ -126,6 +135,8 @@ contract JobEscrow {
     error JobNotDisputed(uint256 jobId, JobStatus status);
     error ResponseWindowElapsed(uint256 jobId, uint64 claimableAfter);
     error ResponseWindowNotElapsed(uint256 jobId, uint64 claimableAfter);
+    error MinBondRatioTooHigh(uint256 requested, uint256 max);
+    error ResponseWindowTooLong(uint64 requested, uint64 max);
 
     // ------------------------------------------------------------- modifiers
 
@@ -248,38 +259,84 @@ contract JobEscrow {
 
     /// @notice Buyer disputes instead of releasing: records evidenceHash on-chain (the hash,
     /// not raw evidence) and flips status to Disputed. No fund movement yet — that only
-    /// happens at resolveDispute. Only callable by the job's buyer, before
-    /// completionDeadline + responseWindow.
+    /// happens at resolveDispute. Only callable by the job's buyer, while Active, and only up
+    /// to completionDeadline + responseWindow — same window release() enforces, so the two
+    /// buyer-facing choices share one deadline.
     function dispute(uint256 jobId, bytes32 evidenceHash) external onlyBuyer(jobId) {
-        // TODO
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Active) revert JobNotActive(jobId, job.status);
+
+        uint64 claimableAfter = job.completionDeadline + responseWindow;
+        if (block.timestamp >= claimableAfter) revert ResponseWindowElapsed(jobId, claimableAfter);
+
+        job.status = JobStatus.Disputed;
+        job.evidenceHash = evidenceHash;
+        emit JobDisputed(jobId, evidenceHash);
     }
 
     /// @notice Arbiter resolves a dispute. sellerAtFault=true slashes the reserved bond to
     /// the buyer and separately refunds the escrowed amount; sellerAtFault=false pays the
     /// seller as if released normally. MVP: single arbiter address, disclosed as
-    /// centralized-for-now.
+    /// centralized-for-now. Unlike Active jobs there is no timeout rescue once Disputed — a
+    /// disallowed dispute sits until the arbiter acts (see plans/08-disclosures.md).
     function resolveDispute(uint256 jobId, bool sellerAtFault) external onlyArbiter {
-        // TODO
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Disputed) revert JobNotDisputed(jobId, job.status);
+
+        job.status = JobStatus.Resolved;
+        emit JobResolved(jobId, sellerAtFault);
+
+        if (sellerAtFault) {
+            // Buyer receives two separate payments: the slashed bond straight from
+            // SellerBond, plus the escrowed amount refunded from JobEscrow's own
+            // holdings — real compensation on top of just getting their own money back.
+            sellerBond.slash(job.sellerAgentId, job.reservedBond, job.buyer);
+            USDC.safeTransfer(job.buyer, job.amount);
+        } else {
+            // The dispute didn't find the seller at fault, so they're paid exactly as if
+            // the buyer had called release() — same two calls, same amounts.
+            sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+            USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
+        }
     }
 
     /// @notice Anyone may trigger auto-release to the seller once
     /// completionDeadline + responseWindow has passed with the buyer having done nothing —
     /// without this a buyer could grief a seller forever by simply not responding.
     function claimTimeout(uint256 jobId) external {
-        // TODO
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Active) revert JobNotActive(jobId, job.status);
+
+        uint64 claimableAfter = job.completionDeadline + responseWindow;
+        if (block.timestamp < claimableAfter) revert ResponseWindowNotElapsed(jobId, claimableAfter);
+
+        job.status = JobStatus.TimedOut;
+        emit JobTimedOut(jobId);
+
+        sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+        USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
     }
 
     /// @notice Update the risk parameter controlling how much bond a job requires, as a
     /// fraction of job amount in basis points. Applies to jobs created after the change —
-    /// already-active jobs keep their snapshotted reservedBond (invariant 1).
+    /// already-active jobs keep their snapshotted reservedBond (invariant 1). Capped at
+    /// MAX_MIN_BOND_RATIO_BPS.
     function setMinBondRatioBps(uint256 newRatioBps) external onlyOwner {
-        // TODO
+        if (newRatioBps > MAX_MIN_BOND_RATIO_BPS) {
+            revert MinBondRatioTooHigh(newRatioBps, MAX_MIN_BOND_RATIO_BPS);
+        }
+        emit MinBondRatioBpsUpdated(minBondRatioBps, newRatioBps);
+        minBondRatioBps = newRatioBps;
     }
 
     /// @notice Update the combined dispute window / timeout grace period. Applies to jobs
     /// created after the change — an already-active job's deadline math was fixed at its own
-    /// completionDeadline, set at creation time.
+    /// completionDeadline, set at creation time. Capped at MAX_RESPONSE_WINDOW.
     function setResponseWindow(uint64 newWindow) external onlyOwner {
-        // TODO
+        if (newWindow > MAX_RESPONSE_WINDOW) {
+            revert ResponseWindowTooLong(newWindow, MAX_RESPONSE_WINDOW);
+        }
+        emit ResponseWindowUpdated(responseWindow, newWindow);
+        responseWindow = newWindow;
     }
 }

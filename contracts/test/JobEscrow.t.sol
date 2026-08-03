@@ -48,7 +48,14 @@ contract JobEscrowTest is Test {
         uint64 completionDeadline
     );
     event JobReleased(uint256 indexed jobId);
+    event JobDisputed(uint256 indexed jobId, bytes32 evidenceHash);
+    event JobResolved(uint256 indexed jobId, bool sellerAtFault);
+    event JobTimedOut(uint256 indexed jobId);
     event SellerBondSet(address sellerBond);
+    event MinBondRatioBpsUpdated(uint256 previous, uint256 current);
+    event ResponseWindowUpdated(uint64 previous, uint64 current);
+
+    bytes32 internal constant EVIDENCE_HASH = keccak256("bad-delivery");
 
     /// Fresh state before every test: the full two-step deploy (JobEscrow first, then
     /// SellerBond with JobEscrow's address baked in, then setSellerBond wires them together),
@@ -261,5 +268,195 @@ contract JobEscrowTest is Test {
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(JobEscrow.ResponseWindowElapsed.selector, jobId, claimableAfter));
         jobEscrow.release(jobId);
+    }
+
+    // ------------------------------------------------------------------ dispute
+
+    /// The core happy path: evidence hash recorded, status flips, no funds move yet —
+    /// resolution (and any payout) only happens at resolveDispute.
+    function test_DisputeRecordsEvidenceAndFlipsStatus() public {
+        uint256 jobId = _createJob();
+
+        vm.expectEmit(true, false, false, true);
+        emit JobDisputed(jobId, EVIDENCE_HASH);
+        vm.prank(buyer);
+        jobEscrow.dispute(jobId, EVIDENCE_HASH);
+
+        (,,,,,, JobEscrow.JobStatus status,, bytes32 evidenceHash) = jobEscrow.jobs(jobId);
+        assertEq(uint8(status), uint8(JobEscrow.JobStatus.Disputed), "status should be Disputed");
+        assertEq(evidenceHash, EVIDENCE_HASH, "evidenceHash should be recorded");
+        assertEq(usdc.balanceOf(address(jobEscrow)), AMOUNT, "escrow should still hold the payment");
+        assertEq(sellerBond.reserved(SELLER_AGENT_ID), REQUIRED_BOND, "reservation should still be locked");
+    }
+
+    function test_RevertWhen_DisputeByNonBuyer() public {
+        uint256 jobId = _createJob();
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.NotBuyer.selector, jobId, stranger));
+        jobEscrow.dispute(jobId, EVIDENCE_HASH);
+    }
+
+    /// Disputing an already-resolved (here: released) job must fail — status only moves
+    /// forward once, and Disputed is only reachable from Active.
+    function test_RevertWhen_DisputeNotActive() public {
+        uint256 jobId = _createJob();
+        vm.startPrank(buyer);
+        jobEscrow.release(jobId);
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.JobNotActive.selector, jobId, JobEscrow.JobStatus.Released));
+        jobEscrow.dispute(jobId, EVIDENCE_HASH);
+        vm.stopPrank();
+    }
+
+    /// Same window as release() — past it, only claimTimeout applies.
+    function test_RevertWhen_DisputeAfterResponseWindowElapsed() public {
+        uint256 jobId = _createJob();
+        uint64 claimableAfter = completionDeadline + jobEscrow.responseWindow();
+        vm.warp(claimableAfter);
+
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.ResponseWindowElapsed.selector, jobId, claimableAfter));
+        jobEscrow.dispute(jobId, EVIDENCE_HASH);
+    }
+
+    // ------------------------------------------------------------------ resolveDispute
+
+    function _createAndDisputeJob() internal returns (uint256 jobId) {
+        jobId = _createJob();
+        vm.prank(buyer);
+        jobEscrow.dispute(jobId, EVIDENCE_HASH);
+    }
+
+    /// The pitch's core mechanic: the buyer gets made whole *and* compensated. Two separate
+    /// transfers land in the buyer's wallet — the escrowed refund from JobEscrow, and the
+    /// slashed bond straight from SellerBond — and the seller's stake permanently shrinks.
+    function test_ResolveDisputeSellerAtFaultSlashesBondAndRefundsBuyer() public {
+        uint256 jobId = _createAndDisputeJob();
+
+        vm.expectEmit(true, false, false, true);
+        emit JobResolved(jobId, true);
+        vm.prank(arbiter);
+        jobEscrow.resolveDispute(jobId, true);
+
+        assertEq(usdc.balanceOf(buyer), AMOUNT + REQUIRED_BOND, "buyer should get the refund plus the slashed bond");
+        assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "reservation should be consumed by the slash");
+        assertEq(
+            sellerBond.bondOf(SELLER_AGENT_ID), SELLER_STAKE - REQUIRED_BOND, "seller's stake should permanently shrink"
+        );
+
+        (,,,,,, JobEscrow.JobStatus status,,) = jobEscrow.jobs(jobId);
+        assertEq(uint8(status), uint8(JobEscrow.JobStatus.Resolved), "status should be Resolved");
+    }
+
+    /// A dispute that doesn't find the seller at fault pays out exactly like release() would.
+    function test_ResolveDisputeSellerNotAtFaultPaysSellerNormally() public {
+        uint256 jobId = _createAndDisputeJob();
+
+        vm.prank(arbiter);
+        jobEscrow.resolveDispute(jobId, false);
+
+        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should be paid in full");
+        assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "reservation should be released, not slashed");
+        assertEq(sellerBond.bondOf(SELLER_AGENT_ID), SELLER_STAKE, "seller's full stake should be free again");
+    }
+
+    function test_RevertWhen_ResolveDisputeByNonArbiter() public {
+        uint256 jobId = _createAndDisputeJob();
+        vm.prank(stranger);
+        vm.expectRevert(JobEscrow.NotArbiter.selector);
+        jobEscrow.resolveDispute(jobId, true);
+    }
+
+    /// Only a Disputed job can be resolved — an Active job must go through dispute() first.
+    function test_RevertWhen_ResolveDisputeNotDisputed() public {
+        uint256 jobId = _createJob();
+        vm.prank(arbiter);
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.JobNotDisputed.selector, jobId, JobEscrow.JobStatus.Active));
+        jobEscrow.resolveDispute(jobId, true);
+    }
+
+    // ------------------------------------------------------------------ claimTimeout
+
+    /// Anyone — not just the buyer or seller — may trigger the rescue once the window has
+    /// elapsed with the buyer having done nothing.
+    function test_ClaimTimeoutPaysSellerAfterWindow() public {
+        uint256 jobId = _createJob();
+        uint64 claimableAfter = completionDeadline + jobEscrow.responseWindow();
+        vm.warp(claimableAfter);
+
+        vm.expectEmit(true, false, false, true);
+        emit JobTimedOut(jobId);
+        vm.prank(stranger);
+        jobEscrow.claimTimeout(jobId);
+
+        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should be paid in full");
+        assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "reservation should be released");
+
+        (,,,,,, JobEscrow.JobStatus status,,) = jobEscrow.jobs(jobId);
+        assertEq(uint8(status), uint8(JobEscrow.JobStatus.TimedOut), "status should be TimedOut");
+    }
+
+    function test_RevertWhen_ClaimTimeoutBeforeWindowElapsed() public {
+        uint256 jobId = _createJob();
+        uint64 claimableAfter = completionDeadline + jobEscrow.responseWindow();
+
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.ResponseWindowNotElapsed.selector, jobId, claimableAfter));
+        jobEscrow.claimTimeout(jobId);
+    }
+
+    /// A job the buyer already released can't also be timed out — status only moves forward
+    /// once, and TimedOut is only reachable from Active.
+    function test_RevertWhen_ClaimTimeoutNotActive() public {
+        uint256 jobId = _createJob();
+        vm.prank(buyer);
+        jobEscrow.release(jobId);
+
+        uint64 claimableAfter = completionDeadline + jobEscrow.responseWindow();
+        vm.warp(claimableAfter);
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.JobNotActive.selector, jobId, JobEscrow.JobStatus.Released));
+        jobEscrow.claimTimeout(jobId);
+    }
+
+    // ------------------------------------------------------------------ setMinBondRatioBps
+
+    function test_SetMinBondRatioBpsEmitsAndApplies() public {
+        vm.expectEmit(false, false, false, true);
+        emit MinBondRatioBpsUpdated(2000, 1000);
+        jobEscrow.setMinBondRatioBps(1000);
+        assertEq(jobEscrow.minBondRatioBps(), 1000, "ratio should update");
+    }
+
+    function test_RevertWhen_SetMinBondRatioBpsNotOwner() public {
+        vm.prank(stranger);
+        vm.expectRevert(JobEscrow.NotOwner.selector);
+        jobEscrow.setMinBondRatioBps(1000);
+    }
+
+    /// The 100% ceiling holds — bounding what a careless or compromised owner key could brick.
+    function test_RevertWhen_SetMinBondRatioBpsAboveMax() public {
+        uint256 tooHigh = 10_000 + 1;
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.MinBondRatioTooHigh.selector, tooHigh, uint256(10_000)));
+        jobEscrow.setMinBondRatioBps(tooHigh);
+    }
+
+    // ------------------------------------------------------------------ setResponseWindow
+
+    function test_SetResponseWindowEmitsAndApplies() public {
+        vm.expectEmit(false, false, false, true);
+        emit ResponseWindowUpdated(48 hours, 1 hours);
+        jobEscrow.setResponseWindow(1 hours);
+        assertEq(jobEscrow.responseWindow(), 1 hours, "window should update");
+    }
+
+    function test_RevertWhen_SetResponseWindowNotOwner() public {
+        vm.prank(stranger);
+        vm.expectRevert(JobEscrow.NotOwner.selector);
+        jobEscrow.setResponseWindow(1 hours);
+    }
+
+    /// The 30-day ceiling holds — bounding what a compromised owner key could freeze.
+    function test_RevertWhen_SetResponseWindowAboveMax() public {
+        uint64 tooLong = 30 days + 1;
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.ResponseWindowTooLong.selector, tooLong, uint64(30 days)));
+        jobEscrow.setResponseWindow(tooLong);
     }
 }
