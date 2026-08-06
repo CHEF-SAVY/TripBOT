@@ -121,6 +121,11 @@ contract JobEscrow {
 
     mapping(uint256 => Job) public jobs;
     uint256 public nextJobId;
+    // Tracks every validationRequestHash that has already claimed a job, so a seller's
+    // registered request can only ever back one createJob call — see
+    // ValidationRequestHashAlreadyUsed. Only populated when validationRegistryEnabled (see
+    // createJob), so the disabled pathway's bytes32(0) placeholder never collides here.
+    mapping(bytes32 => bool) public validationRequestHashUsed;
 
     // ---------------------------------------------------------------- events
 
@@ -165,6 +170,12 @@ contract JobEscrow {
     // to tell "registry-related createJob failure" apart from an unrelated bad-input
     // revert like ZeroAmount or DeadlineNotInFuture.
     error ValidationRequestInvalid(bytes32 requestHash, uint256 sellerAgentId);
+    // isValidationRequestValid is a pure read — nothing else marks a requestHash as
+    // consumed, so without this a hash could be reused across multiple jobs, and whichever
+    // job's exit path attests last would silently overwrite an earlier job's attestation on
+    // the same hash. Global (not per-agent), matching the real registry's own requestHash
+    // uniqueness scope.
+    error ValidationRequestHashAlreadyUsed(bytes32 requestHash);
 
     // ------------------------------------------------------------- modifiers
 
@@ -252,8 +263,17 @@ contract JobEscrow {
         // try/catch here) is the actual answer to "the registry is down for a long time":
         // the owner flips it off in one transaction, and createJob stops depending on it
         // entirely until it's back.
-        if (validationRegistryEnabled && !isValidationRequestValid(validationRequestHash, sellerAgentId)) {
-            revert ValidationRequestInvalid(validationRequestHash, sellerAgentId);
+        if (validationRegistryEnabled) {
+            if (!isValidationRequestValid(validationRequestHash, sellerAgentId)) {
+                revert ValidationRequestInvalid(validationRequestHash, sellerAgentId);
+            }
+            // One requestHash, one job — see ValidationRequestHashAlreadyUsed. Marked here,
+            // not left implicit, so reuse fails loudly instead of silently corrupting a
+            // later attestation.
+            if (validationRequestHashUsed[validationRequestHash]) {
+                revert ValidationRequestHashAlreadyUsed(validationRequestHash);
+            }
+            validationRequestHashUsed[validationRequestHash] = true;
         }
 
         // Snapshotted now, not re-read at payout — see the Job struct's sellerPayoutAddress

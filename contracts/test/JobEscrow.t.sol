@@ -262,6 +262,37 @@ contract JobEscrowTest is Test {
         jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
     }
 
+    /// A requestHash already claimed by one job must not back a second one — without this,
+    /// two jobs sharing a hash would silently corrupt each other's attestation later (see
+    /// ValidationRequestHashAlreadyUsed).
+    function test_RevertWhen_CreateJobReusesAlreadyClaimedHash() public {
+        bytes32 requestHash = keccak256("reuse-me");
+        _createJobWithValidHash(requestHash); // first job legitimately claims the hash
+
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.ValidationRequestHashAlreadyUsed.selector, requestHash));
+        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
+    }
+
+    /// Two distinct, independently-registered hashes for the same seller must both work —
+    /// confirms the fix is "no reuse of one hash," not an overbroad "one hash per seller."
+    function test_CreateJobSucceedsWithTwoDistinctHashesForSameSeller() public {
+        uint256 jobId1 = _createJobWithValidHash(keccak256("distinct-hash-one"));
+
+        // A second job needs its own USDC allowance and enough free bond — top up both.
+        usdc.mint(buyer, AMOUNT);
+        vm.prank(buyer);
+        usdc.approve(address(jobEscrow), AMOUNT);
+        usdc.mint(seller, REQUIRED_BOND);
+        vm.startPrank(seller);
+        usdc.approve(address(sellerBond), REQUIRED_BOND);
+        sellerBond.deposit(SELLER_AGENT_ID, REQUIRED_BOND);
+        vm.stopPrank();
+
+        uint256 jobId2 = _createJobWithValidHash(keccak256("distinct-hash-two"));
+        assertTrue(jobId2 != jobId1, "should be two distinct jobs");
+    }
+
     // ------------------------------------------------------------------ release
 
     function _createJob() internal returns (uint256 jobId) {
