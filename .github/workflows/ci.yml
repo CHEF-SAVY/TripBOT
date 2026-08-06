@@ -20,7 +20,11 @@ jobs:
       - name: Build
         run: forge build
       - name: Test
-        run: forge test -vvv
+        # ArcForkIntegration forks live Arc testnet (see its own doc comment) — a pre-deploy
+        # smoke test, not a unit-test replacement, so CI shouldn't depend on live network
+        # access (and its latency) on every push. Run it manually before Phase 4 deploys via
+        # `forge test --match-contract ArcForkIntegration`.
+        run: forge test -vvv --no-match-contract ArcForkIntegration
 
   app:
     name: App (lint + typecheck)
