@@ -6,18 +6,26 @@ import {JobEscrow} from "../src/JobEscrow.sol";
 import {SellerBond} from "../src/SellerBond.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
+import {MockValidationRegistry} from "./mocks/MockValidationRegistry.sol";
 
 /// @title JobEscrowTest — unit tests for JobEscrow against mocked externals + a real SellerBond
 /// @notice SellerBond is real (not mocked) here on purpose: plan 05's test list wants
 /// createJob's insufficient-bond revert to come from SellerBond.reserve() itself, not a
 /// duplicate check in JobEscrow — so the test needs the actual reservation accounting, not a
-/// stand-in. Only the Identity Registry and USDC are mocked. The Validation Registry address
-/// is a placeholder — no calls are wired into it until Phase 3.
+/// stand-in. Only the Identity Registry and USDC are mocked.
+///
+/// validationRegistryEnabled defaults true on JobEscrow itself, but every pre-Phase-3 test in
+/// this file was written passing bytes32(0) as validationRequestHash, from back when the flag
+/// had no effect. Rather than registering a real hash at all 30+ of those call sites, setUp()
+/// disables the flag once so their original behavior is preserved unchanged; the
+/// Validation-Registry-specific tests re-enable it deliberately and use
+/// _createJobWithValidHash.
 contract JobEscrowTest is Test {
     // ------------------------------------------------------------------ fixtures
 
     MockUSDC internal usdc;
     MockIdentityRegistry internal registry;
+    MockValidationRegistry internal validationRegistry;
     JobEscrow internal jobEscrow;
     SellerBond internal sellerBond;
 
@@ -25,7 +33,6 @@ contract JobEscrowTest is Test {
     address internal seller = makeAddr("seller");
     address internal arbiter = makeAddr("arbiter");
     address internal stranger = makeAddr("stranger");
-    address internal validationRegistryPlaceholder = makeAddr("validationRegistry");
 
     uint256 internal constant SELLER_AGENT_ID = 851_889;
 
@@ -54,6 +61,7 @@ contract JobEscrowTest is Test {
     event SellerBondSet(address sellerBond);
     event MinBondRatioBpsUpdated(uint256 previous, uint256 current);
     event ResponseWindowUpdated(uint64 previous, uint64 current);
+    event ValidationRegistryEnabledUpdated(bool previous, bool current);
 
     bytes32 internal constant EVIDENCE_HASH = keccak256("bad-delivery");
 
@@ -64,9 +72,13 @@ contract JobEscrowTest is Test {
     function setUp() public {
         usdc = new MockUSDC();
         registry = new MockIdentityRegistry();
-        jobEscrow = new JobEscrow(address(usdc), address(registry), validationRegistryPlaceholder, arbiter);
+        validationRegistry = new MockValidationRegistry();
+        jobEscrow = new JobEscrow(address(usdc), address(registry), address(validationRegistry), arbiter);
         sellerBond = new SellerBond(address(usdc), address(registry), address(jobEscrow));
         jobEscrow.setSellerBond(address(sellerBond));
+        // Restores pre-Phase-3 behavior for every existing bytes32(0)-hash test — see the
+        // contract-level @notice above.
+        jobEscrow.setValidationRegistryEnabled(false);
 
         registry.setAgentOwner(SELLER_AGENT_ID, seller);
         usdc.mint(seller, SELLER_STAKE);
@@ -85,7 +97,7 @@ contract JobEscrowTest is Test {
     // ------------------------------------------------------------------ setSellerBond
 
     function test_SetSellerBondWiresAddressAndEmits() public {
-        JobEscrow fresh = new JobEscrow(address(usdc), address(registry), validationRegistryPlaceholder, arbiter);
+        JobEscrow fresh = new JobEscrow(address(usdc), address(registry), address(validationRegistry), arbiter);
         SellerBond freshBond = new SellerBond(address(usdc), address(registry), address(fresh));
 
         vm.expectEmit(false, false, false, true);
@@ -96,7 +108,7 @@ contract JobEscrowTest is Test {
     }
 
     function test_RevertWhen_SetSellerBondByNonOwner() public {
-        JobEscrow fresh = new JobEscrow(address(usdc), address(registry), validationRegistryPlaceholder, arbiter);
+        JobEscrow fresh = new JobEscrow(address(usdc), address(registry), address(validationRegistry), arbiter);
         vm.prank(stranger);
         vm.expectRevert(JobEscrow.NotOwner.selector);
         fresh.setSellerBond(makeAddr("someSellerBond"));
@@ -185,7 +197,7 @@ contract JobEscrowTest is Test {
     /// createJob must fail cleanly, not silently escrow funds with no bond backing them, if
     /// the two-step deploy's wiring call was never made.
     function test_RevertWhen_CreateJobSellerBondNotSet() public {
-        JobEscrow unwired = new JobEscrow(address(usdc), address(registry), validationRegistryPlaceholder, arbiter);
+        JobEscrow unwired = new JobEscrow(address(usdc), address(registry), address(validationRegistry), arbiter);
         vm.prank(buyer);
         vm.expectRevert(JobEscrow.SellerBondNotSet.selector);
         unwired.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
@@ -213,11 +225,58 @@ contract JobEscrowTest is Test {
         jobEscrow.createJob(ghostAgent, AMOUNT, completionDeadline, bytes32(0));
     }
 
+    // ---------------------------------------------------- createJob validation registry gate
+
+    /// The hard gate only fires when validationRegistryEnabled — off by default in this
+    /// suite's setUp() (see the contract-level doc comment), so every test in this section
+    /// turns it back on explicitly.
+    function test_CreateJobSucceedsWithValidHashWhenRegistryEnabled() public {
+        uint256 jobId = _createJobWithValidHash(keccak256("gate-happy-path"));
+        (,,,,,,, JobEscrow.JobStatus status,,) = jobEscrow.jobs(jobId);
+        assertEq(uint8(status), uint8(JobEscrow.JobStatus.Active), "job should be created Active");
+    }
+
+    function test_RevertWhen_CreateJobRegistryEnabledAndHashUnregistered() public {
+        jobEscrow.setValidationRegistryEnabled(true);
+        bytes32 requestHash = keccak256("never-registered");
+
+        vm.prank(buyer);
+        vm.expectRevert(
+            abi.encodeWithSelector(JobEscrow.ValidationRequestInvalid.selector, requestHash, SELLER_AGENT_ID)
+        );
+        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
+    }
+
+    /// A requestHash that's registered, but names some other address as validator, must not
+    /// satisfy this JobEscrow's gate — a seller registering for a different validator can't
+    /// accidentally (or deliberately) pass that registration off as valid here.
+    function test_RevertWhen_CreateJobRegistryEnabledAndWrongValidator() public {
+        jobEscrow.setValidationRegistryEnabled(true);
+        bytes32 requestHash = keccak256("wrong-validator-for-job");
+        validationRegistry.validationRequest(makeAddr("notJobEscrow"), SELLER_AGENT_ID, "", requestHash);
+
+        vm.prank(buyer);
+        vm.expectRevert(
+            abi.encodeWithSelector(JobEscrow.ValidationRequestInvalid.selector, requestHash, SELLER_AGENT_ID)
+        );
+        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
+    }
+
     // ------------------------------------------------------------------ release
 
     function _createJob() internal returns (uint256 jobId) {
         vm.prank(buyer);
         jobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
+    }
+
+    /// Like _createJob, but with validationRegistryEnabled turned on and a real hash
+    /// registered on the mock beforehand — used by the Validation Registry gate/attestation
+    /// tests, which need a job that will actually pass the enabled hard gate.
+    function _createJobWithValidHash(bytes32 requestHash) internal returns (uint256 jobId) {
+        jobEscrow.setValidationRegistryEnabled(true);
+        validationRegistry.validationRequest(address(jobEscrow), SELLER_AGENT_ID, "", requestHash);
+        vm.prank(buyer);
+        jobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
     }
 
     /// The core happy path: seller gets paid in full, the reservation is released back to
@@ -464,6 +523,189 @@ contract JobEscrowTest is Test {
         uint64 tooLong = 30 days + 1;
         vm.expectRevert(abi.encodeWithSelector(JobEscrow.ResponseWindowTooLong.selector, tooLong, uint64(30 days)));
         jobEscrow.setResponseWindow(tooLong);
+    }
+
+    // ------------------------------------------------------------------ setValidationRegistryEnabled
+
+    /// setUp() already disabled the flag (see the contract-level doc comment above), so this
+    /// tests the false -> true transition; the gate/attestation tests below cover re-enabling
+    /// for real.
+    function test_SetValidationRegistryEnabledEmitsAndApplies() public {
+        vm.expectEmit(false, false, false, true);
+        emit ValidationRegistryEnabledUpdated(false, true);
+        jobEscrow.setValidationRegistryEnabled(true);
+        assertTrue(jobEscrow.validationRegistryEnabled(), "flag should update");
+    }
+
+    function test_RevertWhen_SetValidationRegistryEnabledNotOwner() public {
+        vm.prank(stranger);
+        vm.expectRevert(JobEscrow.NotOwner.selector);
+        jobEscrow.setValidationRegistryEnabled(true);
+    }
+
+    // ------------------------------------------------------------------ isValidationRequestValid
+
+    function test_IsValidationRequestValid_TrueForRegisteredRequest() public {
+        bytes32 requestHash = keccak256("valid-request");
+        validationRegistry.validationRequest(address(jobEscrow), SELLER_AGENT_ID, "", requestHash);
+        assertTrue(jobEscrow.isValidationRequestValid(requestHash, SELLER_AGENT_ID));
+    }
+
+    function test_IsValidationRequestValid_FalseForUnregisteredHash() public view {
+        assertFalse(jobEscrow.isValidationRequestValid(keccak256("never-requested"), SELLER_AGENT_ID));
+    }
+
+    /// A request naming some other validator (not this JobEscrow) must not pass — otherwise
+    /// any seller's registration for a different, unrelated validator would incorrectly
+    /// satisfy this JobEscrow's gate.
+    function test_IsValidationRequestValid_FalseForWrongValidator() public {
+        bytes32 requestHash = keccak256("wrong-validator");
+        validationRegistry.validationRequest(makeAddr("someOtherValidator"), SELLER_AGENT_ID, "", requestHash);
+        assertFalse(jobEscrow.isValidationRequestValid(requestHash, SELLER_AGENT_ID));
+    }
+
+    /// A request correctly naming this JobEscrow, but for a different sellerAgentId, must
+    /// not validate a job being created for SELLER_AGENT_ID.
+    function test_IsValidationRequestValid_FalseForWrongAgent() public {
+        bytes32 requestHash = keccak256("wrong-agent");
+        validationRegistry.validationRequest(address(jobEscrow), SELLER_AGENT_ID + 1, "", requestHash);
+        assertFalse(jobEscrow.isValidationRequestValid(requestHash, SELLER_AGENT_ID));
+    }
+
+    // ------------------------------------------------------------------ validation attestation
+
+    /// release() writes response=100, an empty responseHash, and tag "RELEASED" for the
+    /// job's requestHash.
+    function test_ReleaseWritesReleasedAttestation() public {
+        bytes32 requestHash = keccak256("attest-release");
+        uint256 jobId = _createJobWithValidHash(requestHash);
+
+        vm.prank(buyer);
+        jobEscrow.release(jobId);
+
+        (,, uint8 response, bytes32 responseHash, string memory tag,) =
+            validationRegistry.getValidationStatus(requestHash);
+        assertEq(response, 100, "response should be 100 for a clean release");
+        assertEq(responseHash, bytes32(0), "responseHash should be empty for a clean release");
+        assertEq(tag, "RELEASED", "tag should be RELEASED");
+    }
+
+    /// Invariant 3: a Validation Registry failure inside release()'s attestation call must
+    /// never block the payout itself — the seller still gets paid even though the registry
+    /// call reverted.
+    function test_ReleaseStillPaysOutWhenAttestationReverts() public {
+        bytes32 requestHash = keccak256("attest-release-fails");
+        uint256 jobId = _createJobWithValidHash(requestHash);
+        validationRegistry.setAlwaysRevertOnResponse(requestHash);
+
+        vm.prank(buyer);
+        jobEscrow.release(jobId);
+
+        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should still be paid despite the reverting attestation");
+    }
+
+    /// resolveDispute(sellerAtFault=true) writes response=0, the buyer's real evidenceHash
+    /// (not an empty one), and tag "SELLER_AT_FAULT" — the evidenceHash is what makes this
+    /// attestation genuinely content-addressed and checkable, not just a bare score.
+    function test_ResolveDisputeSellerAtFaultWritesAttestationWithEvidenceHash() public {
+        bytes32 requestHash = keccak256("attest-at-fault");
+        uint256 jobId = _createJobWithValidHash(requestHash);
+        vm.prank(buyer);
+        jobEscrow.dispute(jobId, EVIDENCE_HASH);
+
+        vm.prank(arbiter);
+        jobEscrow.resolveDispute(jobId, true);
+
+        (,, uint8 response, bytes32 responseHash, string memory tag,) =
+            validationRegistry.getValidationStatus(requestHash);
+        assertEq(response, 0, "response should be 0 for seller at fault");
+        assertEq(responseHash, EVIDENCE_HASH, "responseHash should carry the buyer's dispute evidence hash");
+        assertEq(tag, "SELLER_AT_FAULT", "tag should be SELLER_AT_FAULT");
+    }
+
+    /// Invariant 3, at-fault path: the slash + refund must still complete even when the
+    /// attestation call reverts.
+    function test_ResolveDisputeSellerAtFaultStillPaysOutWhenAttestationReverts() public {
+        bytes32 requestHash = keccak256("attest-at-fault-fails");
+        uint256 jobId = _createJobWithValidHash(requestHash);
+        vm.prank(buyer);
+        jobEscrow.dispute(jobId, EVIDENCE_HASH);
+        validationRegistry.setAlwaysRevertOnResponse(requestHash);
+
+        vm.prank(arbiter);
+        jobEscrow.resolveDispute(jobId, true);
+
+        assertEq(
+            usdc.balanceOf(buyer),
+            AMOUNT + REQUIRED_BOND,
+            "buyer should still get the refund plus the slashed bond despite the reverting attestation"
+        );
+    }
+
+    /// resolveDispute(sellerAtFault=false) writes response=100 and tag
+    /// "DISPUTE_RESOLVED_SELLER" — a distinct tag from a plain release() so an off-chain
+    /// observer can tell "went through a dispute and the seller cleared" apart from "buyer
+    /// never disputed at all", even though the payout is identical.
+    function test_ResolveDisputeSellerNotAtFaultWritesAttestation() public {
+        bytes32 requestHash = keccak256("attest-not-at-fault");
+        uint256 jobId = _createJobWithValidHash(requestHash);
+        vm.prank(buyer);
+        jobEscrow.dispute(jobId, EVIDENCE_HASH);
+
+        vm.prank(arbiter);
+        jobEscrow.resolveDispute(jobId, false);
+
+        (,, uint8 response, bytes32 responseHash, string memory tag,) =
+            validationRegistry.getValidationStatus(requestHash);
+        assertEq(response, 100, "response should be 100");
+        assertEq(responseHash, bytes32(0), "responseHash should be empty");
+        assertEq(tag, "DISPUTE_RESOLVED_SELLER", "tag should be DISPUTE_RESOLVED_SELLER");
+    }
+
+    /// claimTimeout() writes response=50 (indeterminate, not 100 — nobody actually confirmed
+    /// delivery, the buyer just never responded) and tag "TIMED_OUT".
+    function test_ClaimTimeoutWritesTimedOutAttestation() public {
+        bytes32 requestHash = keccak256("attest-timeout");
+        uint256 jobId = _createJobWithValidHash(requestHash);
+        vm.warp(completionDeadline + jobEscrow.responseWindow());
+
+        jobEscrow.claimTimeout(jobId);
+
+        (,, uint8 response, bytes32 responseHash, string memory tag,) =
+            validationRegistry.getValidationStatus(requestHash);
+        assertEq(response, 50, "response should be 50 (indeterminate) for a timeout");
+        assertEq(responseHash, bytes32(0), "responseHash should be empty");
+        assertEq(tag, "TIMED_OUT", "tag should be TIMED_OUT");
+    }
+
+    /// Invariant 3, timeout path: the auto-release to the seller must still complete even
+    /// when the attestation call reverts.
+    function test_ClaimTimeoutStillPaysOutWhenAttestationReverts() public {
+        bytes32 requestHash = keccak256("attest-timeout-fails");
+        uint256 jobId = _createJobWithValidHash(requestHash);
+        validationRegistry.setAlwaysRevertOnResponse(requestHash);
+        vm.warp(completionDeadline + jobEscrow.responseWindow());
+
+        jobEscrow.claimTimeout(jobId);
+
+        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should still be paid despite the reverting attestation");
+    }
+
+    /// The kill switch also gates the attestation calls, not just createJob's gate — with
+    /// validationRegistryEnabled off, release() must not even attempt validationResponse, so
+    /// the registry's stored status for this (validly registered) requestHash stays at its
+    /// pre-response default: request recorded, but never actually responded to.
+    function test_ReleaseSkipsAttestationWhenRegistryDisabled() public {
+        bytes32 requestHash = keccak256("attest-disabled");
+        uint256 jobId = _createJobWithValidHash(requestHash);
+        jobEscrow.setValidationRegistryEnabled(false);
+
+        vm.prank(buyer);
+        jobEscrow.release(jobId);
+
+        (,, uint8 response,, string memory tag,) = validationRegistry.getValidationStatus(requestHash);
+        assertEq(response, 0, "response should still be the pre-response default");
+        assertEq(tag, "", "tag should still be empty, validationResponse should never have been called");
     }
 
     // ------------------------------------------------------------------ responseDeadline snapshot

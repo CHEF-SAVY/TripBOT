@@ -5,6 +5,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 import {ISellerBond} from "./interfaces/ISellerBond.sol";
+import {IValidationRegistry} from "./interfaces/IValidationRegistry.sol";
 
 /// @title JobEscrow — one job, one escrowed USDC payment, released only on verified delivery
 /// @notice Buyer's USDC sits here until the buyer releases it, an arbiter resolves a dispute
@@ -13,9 +14,9 @@ import {ISellerBond} from "./interfaces/ISellerBond.sol";
 /// seller slashes that same reservation to the buyer, on top of the escrowed refund.
 ///
 /// Implemented incrementally, one function (plus its tests) per change — bodies still marked
-/// TODO are pending, not forgotten. Validation Registry wiring (the requestHash check in
-/// createJob, and the validationResponse calls) is deliberately deferred to Phase 3 — this
-/// phase gets the core escrow state machine correct against mocks first.
+/// TODO are pending, not forgotten. ERC-8004 Validation Registry wiring (the requestHash
+/// gate in createJob, and the validationResponse attestation calls) landed in Phase 3 —
+/// see isValidationRequestValid and _attestValidation.
 contract JobEscrow {
     using SafeERC20 for IERC20;
 
@@ -55,8 +56,10 @@ contract JobEscrow {
         // job was created.
         uint64 responseDeadline;
         JobStatus status;
-        // Hash of the seller's ERC-8004 validationRequest for this job, checked against the
-        // Validation Registry in Phase 3. Zero until that wiring lands.
+        // Hash of the seller's ERC-8004 validationRequest for this job. Checked against the
+        // Validation Registry at createJob() time (isValidationRequestValid) when
+        // validationRegistryEnabled, and reused as the attestation key at every exit path
+        // (_attestValidation).
         bytes32 validationRequestHash;
         // Hash of buyer-submitted dispute evidence — the hash lands on-chain, not raw evidence.
         bytes32 evidenceHash;
@@ -66,11 +69,7 @@ contract JobEscrow {
 
     IERC20 public immutable USDC;
     IIdentityRegistry public immutable IDENTITY_REGISTRY;
-    // Raw address, not a typed interface, for now: the real Validation Registry ABI hasn't
-    // been pulled from Arcscan yet (open question in 01-research-and-decisions.md). Phase 3
-    // introduces IValidationRegistry once that's confirmed — no hand-written interface from
-    // memory, same discipline as IIdentityRegistry.
-    address public immutable VALIDATION_REGISTRY;
+    IValidationRegistry public immutable VALIDATION_REGISTRY;
     // MVP dispute resolution: a single arbiter address (the deployer wallet), disclosed in the
     // README as centralized-for-now. Separate from `owner` — same key for the hackathon, but a
     // one-line change to rotate later without touching risk-parameter ownership.
@@ -86,7 +85,8 @@ contract JobEscrow {
 
     // Gates every Validation Registry external call behind an owner-toggleable switch — the
     // registry's own spec is "still under active discussion," so a flaky registry can never
-    // brick fund movement. Calls themselves aren't wired until Phase 3.
+    // brick fund movement. Owner-only fast kill switch, deliberately no timelock (see
+    // setValidationRegistryEnabled).
     bool public validationRegistryEnabled = true;
     // Risk parameter: required bond as a fraction of job amount, in basis points (2000 = 20%,
     // the spec's starting default). Owner-settable, same category as SellerBond's
@@ -139,6 +139,7 @@ contract JobEscrow {
     event SellerBondSet(address sellerBond);
     event MinBondRatioBpsUpdated(uint256 previous, uint256 current);
     event ResponseWindowUpdated(uint64 previous, uint64 current);
+    event ValidationRegistryEnabledUpdated(bool previous, bool current);
 
     // ---------------------------------------------------------------- errors
 
@@ -159,6 +160,11 @@ contract JobEscrow {
     error ResponseWindowNotElapsed(uint256 jobId, uint64 claimableAfter);
     error MinBondRatioTooHigh(uint256 requested, uint256 max);
     error ResponseWindowTooLong(uint64 requested, uint64 max);
+    // Covers every way isValidationRequestValid can fail (unregistered hash, wrong
+    // validator, wrong agent) — one distinct error type is enough for off-chain monitoring
+    // to tell "registry-related createJob failure" apart from an unrelated bad-input
+    // revert like ZeroAmount or DeadlineNotInFuture.
+    error ValidationRequestInvalid(bytes32 requestHash, uint256 sellerAgentId);
 
     // ------------------------------------------------------------- modifiers
 
@@ -198,7 +204,7 @@ contract JobEscrow {
     constructor(address usdc_, address identityRegistry_, address validationRegistry_, address arbiter_) {
         USDC = IERC20(usdc_);
         IDENTITY_REGISTRY = IIdentityRegistry(identityRegistry_);
-        VALIDATION_REGISTRY = validationRegistry_;
+        VALIDATION_REGISTRY = IValidationRegistry(validationRegistry_);
         ARBITER = arbiter_;
         owner = msg.sender;
     }
@@ -218,10 +224,11 @@ contract JobEscrow {
     /// pulls `amount` USDC into escrow. Reverts via SellerBond.reserve() if the seller's free
     /// bond can't cover minBondRatioBps of `amount` — no duplicate ratio check here,
     /// SellerBond is the source of truth for its own balances.
-    /// @dev `validationRequestHash` is stored on the job but not yet checked against the
-    /// Validation Registry — that verification is Phase 3 (validationRegistryEnabled has no
-    /// effect until then). `IDENTITY_REGISTRY.ownerOf` reverting for an unregistered
-    /// `sellerAgentId` doubles as the existence check, same pattern as SellerBond.deposit.
+    /// @dev When validationRegistryEnabled, `validationRequestHash` must name this contract
+    /// as validator for `sellerAgentId` on the Validation Registry (see
+    /// isValidationRequestValid) — reverts ValidationRequestInvalid otherwise.
+    /// `IDENTITY_REGISTRY.ownerOf` reverting for an unregistered `sellerAgentId` doubles as
+    /// the existence check, same pattern as SellerBond.deposit.
     function createJob(uint256 sellerAgentId, uint256 amount, uint64 completionDeadline, bytes32 validationRequestHash)
         external
         returns (uint256 jobId)
@@ -238,6 +245,16 @@ contract JobEscrow {
             revert DeadlineTooFar(completionDeadline, maxCompletionDeadline);
         }
         if (address(sellerBond) == address(0)) revert SellerBondNotSet();
+        // Hard gate, not swallowed: a revert here can't be distinguished from inside this
+        // call ("seller never registered" vs. "registry is down"), so silently continuing
+        // would make the check meaningless every time anything goes wrong — including a
+        // seller skipping registration on purpose. validationRegistryEnabled (not a
+        // try/catch here) is the actual answer to "the registry is down for a long time":
+        // the owner flips it off in one transaction, and createJob stops depending on it
+        // entirely until it's back.
+        if (validationRegistryEnabled && !isValidationRequestValid(validationRequestHash, sellerAgentId)) {
+            revert ValidationRequestInvalid(validationRequestHash, sellerAgentId);
+        }
 
         // Snapshotted now, not re-read at payout — see the Job struct's sellerPayoutAddress
         // comment for why a buyer's committed counterparty must survive a mid-job NFT
@@ -279,6 +296,17 @@ contract JobEscrow {
         USDC.safeTransferFrom(msg.sender, address(this), amount);
     }
 
+    /// @dev Best-effort ERC-8004 attestation, called from release/resolveDispute/
+    /// claimTimeout. By the time any of them call this, the job's fate is already decided
+    /// by JobEscrow's own state — a Validation Registry failure here must never block a
+    /// payout that's otherwise ready (invariant 3). Checks validationRegistryEnabled first
+    /// so a known-disabled registry costs one SLOAD instead of a wasted external call that
+    /// would just get swallowed anyway.
+    function _attestValidation(bytes32 requestHash, uint8 response, bytes32 responseHash, string memory tag) internal {
+        if (!validationRegistryEnabled) return;
+        try VALIDATION_REGISTRY.validationResponse(requestHash, response, "", responseHash, tag) {} catch {}
+    }
+
     /// @notice Buyer accepts delivery: pays the seller in full, releases the bond
     /// reservation. Only callable by the job's buyer, while Active, and only up to the
     /// job's snapshotted responseDeadline — past that point only claimTimeout applies
@@ -299,6 +327,7 @@ contract JobEscrow {
             sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
         }
         USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
+        _attestValidation(job.validationRequestHash, 100, bytes32(0), "RELEASED");
     }
 
     /// @notice Buyer disputes instead of releasing: records evidenceHash on-chain (the hash,
@@ -339,6 +368,11 @@ contract JobEscrow {
                 sellerBond.slash(job.sellerAgentId, job.reservedBond, job.buyer);
             }
             USDC.safeTransfer(job.buyer, job.amount);
+            // responseHash carries the buyer's actual dispute evidence hash here (not
+            // bytes32(0), unlike the other three attestation call sites) — this is what
+            // makes the at-fault attestation genuinely content-addressed and checkable by
+            // other systems, not just a bare score.
+            _attestValidation(job.validationRequestHash, 0, job.evidenceHash, "SELLER_AT_FAULT");
         } else {
             // The dispute didn't find the seller at fault, so they're paid exactly as if
             // the buyer had called release() — same two calls, same amounts.
@@ -346,6 +380,7 @@ contract JobEscrow {
                 sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
             }
             USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
+            _attestValidation(job.validationRequestHash, 100, bytes32(0), "DISPUTE_RESOLVED_SELLER");
         }
     }
 
@@ -366,6 +401,11 @@ contract JobEscrow {
             sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
         }
         USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
+        // response=50, not 100: a timeout means the buyer simply never responded, not that
+        // delivery was confirmed good. Scoring it identically to a real release() would
+        // overclaim quality nobody actually verified; 50 reads as "indeterminate" on the
+        // registry's 0-100 scale.
+        _attestValidation(job.validationRequestHash, 50, bytes32(0), "TIMED_OUT");
     }
 
     /// @notice Update the risk parameter controlling how much bond a job requires, as a
@@ -389,5 +429,32 @@ contract JobEscrow {
         }
         emit ResponseWindowUpdated(responseWindow, newWindow);
         responseWindow = newWindow;
+    }
+
+    /// @notice Fast kill switch for the Validation Registry integration. Deliberately no
+    /// timelock, unlike the withdrawal/dispute timelocks elsewhere: blast radius if this
+    /// were compromised is low (worst case is jobs created without a registered validation
+    /// request, or attestations silently not written — neither touches escrowed funds or
+    /// the bond-ratio check), and the whole point is to be flippable in one transaction the
+    /// moment the registry misbehaves, not gated behind a delay.
+    function setValidationRegistryEnabled(bool enabled_) external onlyOwner {
+        emit ValidationRegistryEnabledUpdated(validationRegistryEnabled, enabled_);
+        validationRegistryEnabled = enabled_;
+    }
+
+    /// @notice True if `requestHash` names this JobEscrow as validator for `sellerAgentId`
+    /// on the Validation Registry. Never reverts — an unregistered hash, or the registry
+    /// itself reverting outright, both just resolve to false. Serves two callers: createJob
+    /// uses it as its hard gate, and it's public so off-chain monitoring can call it too —
+    /// e.g. checking the registry is healthy before a buyer ever hits a failing createJob,
+    /// without needing a real failed transaction as the signal.
+    function isValidationRequestValid(bytes32 requestHash, uint256 sellerAgentId) public view returns (bool) {
+        try VALIDATION_REGISTRY.getValidationStatus(requestHash) returns (
+            address validatorAddress, uint256 agentId, uint8, bytes32, string memory, uint256
+        ) {
+            return validatorAddress == address(this) && agentId == sellerAgentId;
+        } catch {
+            return false;
+        }
     }
 }
