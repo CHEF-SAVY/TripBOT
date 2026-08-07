@@ -1,26 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.24;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 
-/// @title SellerBond — slashable USDC stake keyed by ERC-8004 agentId
-/// @notice Sellers post USDC stake against their agentId before they're eligible to take
-/// jobs. Bond is reserved per job by JobEscrow (not just ratio-checked at creation), so
+/// @title SellerBond — slashable native-BOT stake keyed by ERC-8004 agentId
+/// @notice Sellers post native BOT stake against their agentId before they're eligible to
+/// take jobs. Bond is reserved per job by JobEscrow (not just ratio-checked at creation), so
 /// every job's eventual slash or release is unconditionally fundable: `slash` can only
 /// consume what `reserve` locked, and `bondOf` nets out both reservations and any pending
 /// withdrawal.
 ///
-/// Implemented incrementally, one function (plus its tests) per change — bodies still
-/// marked TODO are pending, not forgotten.
+/// BOT Chain uses standard native value (like ETH on any EVM chain) as its gas token —
+/// unlike Arc, where USDC is the native gas token with a fixed pseudo-ERC20 interface at
+/// 0x3600...0000. There is no token contract here at all: deposits arrive as `msg.value`,
+/// payouts go out via a low-level `call` carrying value.
 contract SellerBond {
-    /// SafeERC20 wraps every token call so that tokens which signal failure by returning
-    /// `false` (instead of reverting) still abort the transaction. Real USDC reverts on
-    /// failure anyway, but this makes the contract safe against *any* ERC-20 quirk —
-    /// standard defensive practice, costs almost nothing.
-    using SafeERC20 for IERC20;
-
     // ----------------------------------------------------------------- types
 
     struct WithdrawalRequest {
@@ -30,7 +24,6 @@ contract SellerBond {
 
     // ---------------------------------------------------------------- state
 
-    IERC20 public immutable USDC;
     IIdentityRegistry public immutable IDENTITY_REGISTRY;
     /// @notice The only address allowed to reserve, release, or slash bond. Set once at
     /// construction, never mutable — nothing else can ever drain a seller's stake.
@@ -47,7 +40,7 @@ contract SellerBond {
     /// unlockTime, so changing this never retroactively affects an in-flight request.
     uint64 public withdrawalTimelock = 3 days;
 
-    /// agentId => gross USDC posted
+    /// agentId => gross native BOT posted
     mapping(uint256 => uint256) public bondBalance;
     /// agentId => sum locked by active/disputed jobs (moved only by JOB_ESCROW)
     mapping(uint256 => uint256) public reserved;
@@ -76,6 +69,7 @@ contract SellerBond {
     error NoWithdrawalPending(uint256 agentId);
     error TimelockNotExpired(uint256 agentId, uint64 unlockTime);
     error TimelockTooLong(uint64 requested, uint64 max);
+    error NativeTransferFailed(address recipient, uint256 amount);
 
     // ------------------------------------------------------------- modifiers
 
@@ -107,8 +101,7 @@ contract SellerBond {
 
     // ----------------------------------------------------------- constructor
 
-    constructor(address usdc_, address identityRegistry_, address jobEscrow_) {
-        USDC = IERC20(usdc_);
+    constructor(address identityRegistry_, address jobEscrow_) {
         IDENTITY_REGISTRY = IIdentityRegistry(identityRegistry_);
         JOB_ESCROW = jobEscrow_;
         owner = msg.sender;
@@ -116,19 +109,25 @@ contract SellerBond {
 
     // ------------------------------------------------------------- functions
 
-    /// @notice Post stake: pulls `amount` USDC from the caller and credits it to
-    /// `agentId`'s bond. Restricted to the agent's owner/operator so the bond is always
-    /// the seller's *own* skin in the game — that's the economic promise Tripwire makes
-    /// to buyers, so the contract enforces it rather than trusting convention.
-    /// @dev The caller must have `approve`d this contract for at least `amount` first —
-    /// that's how ERC-20 pull-payments work: owner grants an allowance, contract spends it.
+    /// @dev Shared native-value payout path: a low-level `call` (not `.transfer()`,
+    /// which hard-caps forwarded gas at 2300 and can break on recipients with any
+    /// non-trivial receive/fallback logic) that reverts the whole transaction on failure —
+    /// same "money must move or nothing happens" guarantee SafeERC20 gave the USDC version.
+    function _payOut(address recipient, uint256 amount) private {
+        (bool success,) = payable(recipient).call{value: amount}("");
+        if (!success) revert NativeTransferFailed(recipient, amount);
+    }
+
+    /// @notice Post stake: credits `msg.value` native BOT to `agentId`'s bond. Restricted
+    /// to the agent's owner/operator so the bond is always the seller's *own* skin in the
+    /// game — that's the economic promise Tripwire makes to buyers, so the contract
+    /// enforces it rather than trusting convention.
     /// @param agentId The ERC-8004 agent the stake backs (bond is keyed by agent, not by
     /// wallet, so reputation and stake travel together if the agent NFT changes wallets).
-    /// @param amount USDC amount in 6-decimal units (1_000_000 = 1 USDC).
-    function deposit(uint256 agentId, uint256 amount) external {
+    function deposit(uint256 agentId) external payable {
         // Reject zero early: a zero deposit would succeed but only emit a misleading
         // event and waste gas — better to fail loudly.
-        if (amount == 0) revert ZeroAmount();
+        if (msg.value == 0) revert ZeroAmount();
 
         // Ownership gate. Two things happen in this one call:
         //  1. If `agentId` was never registered, the registry itself reverts — so we get
@@ -139,16 +138,10 @@ contract SellerBond {
             revert NotAgentOwnerOrOperator(agentId, msg.sender);
         }
 
-        // Effects before interactions (checks-effects-interactions pattern): we update our
-        // own bookkeeping *before* the external token call. If the transfer fails, the
-        // whole transaction — bookkeeping included — rolls back atomically, so there's no
-        // state where the balance is credited but the money never arrived.
-        bondBalance[agentId] += amount;
-        emit Deposited(agentId, msg.sender, amount);
-
-        // Pull the USDC in. safeTransferFrom reverts on any failure (insufficient
-        // allowance, insufficient balance, token returning false).
-        USDC.safeTransferFrom(msg.sender, address(this), amount);
+        // The value already arrived with the call (native value, unlike a pull-based
+        // ERC-20 transferFrom) — bookkeeping just has to catch up.
+        bondBalance[agentId] += msg.value;
+        emit Deposited(agentId, msg.sender, msg.value);
     }
 
     /// @notice Start a timelocked withdrawal. Only the agent's owner/operator; capped at
@@ -192,7 +185,7 @@ contract SellerBond {
     }
 
     /// @notice Pay out a matured withdrawal request and clear it. Only the agent's
-    /// owner/operator may trigger it, but the USDC always goes to the agent NFT's *current
+    /// owner/operator may trigger it, but the BOT always goes to the agent NFT's *current
     /// owner* — an operator has authority to manage the bond, not to own the proceeds, so
     /// a compromised operator key can never redirect funds to itself. Paying the current
     /// (not request-time) owner also means a mid-timelock agent transfer sends the stake
@@ -221,7 +214,7 @@ contract SellerBond {
         // is self-inflicted, but worth knowing.
         address recipient = IDENTITY_REGISTRY.ownerOf(agentId);
 
-        // Effects before the token interaction, as everywhere else. Both the gross balance
+        // Effects before the value transfer, as everywhere else. Both the gross balance
         // and the pending marker drop by the same amount, so bondOf() — which had already
         // excluded this amount — is unchanged by completion. Free bond moved at *request*
         // time; completion only moves custody.
@@ -229,7 +222,7 @@ contract SellerBond {
         bondBalance[agentId] -= request.amount;
         emit WithdrawalCompleted(agentId, recipient, request.amount);
 
-        USDC.safeTransfer(recipient, request.amount);
+        _payOut(recipient, request.amount);
     }
 
     /// @notice Lock `amount` of the agent's free bond for a job. Only JobEscrow.
@@ -250,7 +243,7 @@ contract SellerBond {
     }
 
     /// @notice Unlock a previous reservation (job released / resolved in seller's favor).
-    /// @dev No token movement here — this only frees bookkeeping room. Whichever side the
+    /// @dev No value movement here — this only frees bookkeeping room. Whichever side the
     /// funds actually end up on was already settled by `release`/`completeWithdrawal`
     /// elsewhere; this call just tells us the job this amount was locked for is done.
     function releaseReservation(uint256 agentId, uint256 amount) external onlyJobEscrow {
@@ -283,7 +276,7 @@ contract SellerBond {
         reserved[agentId] = currentlyReserved - amount;
         emit Slashed(agentId, recipient, amount);
 
-        USDC.safeTransfer(recipient, amount);
+        _payOut(recipient, amount);
     }
 
     /// @notice Free bond available to new jobs or withdrawal requests.

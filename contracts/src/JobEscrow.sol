@@ -1,25 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.24;
 
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 import {ISellerBond} from "./interfaces/ISellerBond.sol";
 import {IValidationRegistry} from "./interfaces/IValidationRegistry.sol";
 
-/// @title JobEscrow — one job, one escrowed USDC payment, released only on verified delivery
-/// @notice Buyer's USDC sits here until the buyer releases it, an arbiter resolves a dispute
+/// @title JobEscrow — one job, one escrowed native-BOT payment, released only on verified delivery
+/// @notice Buyer's BOT sits here until the buyer releases it, an arbiter resolves a dispute
 /// in the seller's favor, or a timeout auto-releases it — never before. The seller must have
 /// bond reserved on SellerBond before a job can start, and a dispute resolved against the
 /// seller slashes that same reservation to the buyer, on top of the escrowed refund.
 ///
-/// Implemented incrementally, one function (plus its tests) per change — bodies still marked
-/// TODO are pending, not forgotten. ERC-8004 Validation Registry wiring (the requestHash
-/// gate in createJob, and the validationResponse attestation calls) landed in Phase 3 —
-/// see isValidationRequestValid and _attestValidation.
+/// BOT Chain uses standard native value as its gas token (like ETH on any EVM chain) —
+/// unlike Arc, where USDC is the native gas token behind a fixed pseudo-ERC20 interface at
+/// 0x3600...0000. Every job's escrowed amount is `msg.value` at createJob time, and every
+/// payout is a low-level `call` carrying value, not an ERC-20 transfer.
+///
+/// ERC-8004 Identity/Validation Registry wiring (the requestHash gate in createJob, and the
+/// validationResponse attestation calls) points at minimal stand-in registries deployed
+/// alongside this contract — no ERC-8004 registry exists on BOT Chain testnet — see
+/// isValidationRequestValid and _attestValidation.
 contract JobEscrow {
-    using SafeERC20 for IERC20;
-
     // ----------------------------------------------------------------- types
 
     enum JobStatus {
@@ -67,7 +68,6 @@ contract JobEscrow {
 
     // ---------------------------------------------------------------- state
 
-    IERC20 public immutable USDC;
     IIdentityRegistry public immutable IDENTITY_REGISTRY;
     IValidationRegistry public immutable VALIDATION_REGISTRY;
     // MVP dispute resolution: a single arbiter address (the deployer wallet), disclosed in the
@@ -112,11 +112,10 @@ contract JobEscrow {
     // in createJob. Two independent reasons this exists: (1) it bounds
     // completionDeadline + responseWindow (both uint64) well clear of type(uint64).max, so
     // that sum can never overflow and permanently lock a job's escrowed funds and reserved
-    // bond with no path out; (2) a "no real deadline" sentinel like type(uint64).max — a
-    // pattern this very codebase's own tests use for USDC allowances
-    // (`approve(..., type(uint256).max)`) — would otherwise be a plausible integration
-    // mistake that triggers exactly that overflow. Not owner-settable: this is a structural
-    // safety bound, not a risk/business parameter like minBondRatioBps or responseWindow.
+    // bond with no path out; (2) a "no real deadline" sentinel like type(uint64).max would
+    // otherwise be a plausible integration mistake that triggers exactly that overflow. Not
+    // owner-settable: this is a structural safety bound, not a risk/business parameter like
+    // minBondRatioBps or responseWindow.
     uint64 public constant MAX_JOB_DURATION = 365 days;
 
     mapping(uint256 => Job) public jobs;
@@ -176,6 +175,7 @@ contract JobEscrow {
     // the same hash. Global (not per-agent), matching the real registry's own requestHash
     // uniqueness scope.
     error ValidationRequestHashAlreadyUsed(bytes32 requestHash);
+    error NativeTransferFailed(address recipient, uint256 amount);
 
     // ------------------------------------------------------------- modifiers
 
@@ -212,8 +212,7 @@ contract JobEscrow {
 
     // ----------------------------------------------------------- constructor
 
-    constructor(address usdc_, address identityRegistry_, address validationRegistry_, address arbiter_) {
-        USDC = IERC20(usdc_);
+    constructor(address identityRegistry_, address validationRegistry_, address arbiter_) {
         IDENTITY_REGISTRY = IIdentityRegistry(identityRegistry_);
         VALIDATION_REGISTRY = IValidationRegistry(validationRegistry_);
         ARBITER = arbiter_;
@@ -231,19 +230,30 @@ contract JobEscrow {
         emit SellerBondSet(sellerBond_);
     }
 
-    /// @notice Buyer opens a job: validates amount/deadline, reserves the seller's bond,
-    /// pulls `amount` USDC into escrow. Reverts via SellerBond.reserve() if the seller's free
-    /// bond can't cover minBondRatioBps of `amount` — no duplicate ratio check here,
+    /// @dev Shared native-value payout path: a low-level `call` (not `.transfer()`, which
+    /// hard-caps forwarded gas at 2300 and can break on recipients with any non-trivial
+    /// receive/fallback logic) that reverts the whole transaction on failure — same "money
+    /// must move or nothing happens" guarantee SafeERC20 gave the USDC version.
+    function _payOut(address recipient, uint256 amount) private {
+        (bool success,) = payable(recipient).call{value: amount}("");
+        if (!success) revert NativeTransferFailed(recipient, amount);
+    }
+
+    /// @notice Buyer opens a job: validates msg.value/deadline, reserves the seller's bond,
+    /// and escrows `msg.value` natively. Reverts via SellerBond.reserve() if the seller's
+    /// free bond can't cover minBondRatioBps of `msg.value` — no duplicate ratio check here,
     /// SellerBond is the source of truth for its own balances.
     /// @dev When validationRegistryEnabled, `validationRequestHash` must name this contract
     /// as validator for `sellerAgentId` on the Validation Registry (see
     /// isValidationRequestValid) — reverts ValidationRequestInvalid otherwise.
     /// `IDENTITY_REGISTRY.ownerOf` reverting for an unregistered `sellerAgentId` doubles as
     /// the existence check, same pattern as SellerBond.deposit.
-    function createJob(uint256 sellerAgentId, uint256 amount, uint64 completionDeadline, bytes32 validationRequestHash)
+    function createJob(uint256 sellerAgentId, uint64 completionDeadline, bytes32 validationRequestHash)
         external
+        payable
         returns (uint256 jobId)
     {
+        uint256 amount = msg.value;
         if (amount == 0) revert ZeroAmount();
         if (completionDeadline <= block.timestamp) revert DeadlineNotInFuture(completionDeadline);
         // Upper-bounds completionDeadline so completionDeadline + responseWindow can never
@@ -305,15 +315,15 @@ contract JobEscrow {
 
         emit JobCreated(jobId, msg.sender, sellerAgentId, amount, reservedBond, completionDeadline);
 
-        // Interactions last. If the seller's free bond can't cover reservedBond,
+        // Interaction last. If the seller's free bond can't cover reservedBond,
         // sellerBond.reserve() reverts and unwinds the job creation atomically — no separate
         // ratio check needed here, SellerBond is the source of truth for its own balances.
         // Skipped entirely when reservedBond is zero (minBondRatioBps == 0): SellerBond
-        // rejects zero-amount calls, and there is genuinely nothing to reserve.
+        // rejects zero-amount calls, and there is genuinely nothing to reserve. The escrowed
+        // `amount` itself needs no separate transfer — it already arrived as native value.
         if (reservedBond > 0) {
             sellerBond.reserve(sellerAgentId, reservedBond);
         }
-        USDC.safeTransferFrom(msg.sender, address(this), amount);
     }
 
     /// @dev Best-effort ERC-8004 attestation, called from release/resolveDispute/
@@ -346,7 +356,7 @@ contract JobEscrow {
         if (job.reservedBond > 0) {
             sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
         }
-        USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
+        _payOut(job.sellerPayoutAddress, job.amount);
         _attestValidation(job.validationRequestHash, 100, bytes32(0), "RELEASED");
     }
 
@@ -371,7 +381,7 @@ contract JobEscrow {
     /// the buyer and separately refunds the escrowed amount; sellerAtFault=false pays the
     /// seller as if released normally. MVP: single arbiter address, disclosed as
     /// centralized-for-now. Unlike Active jobs there is no timeout rescue once Disputed — a
-    /// disallowed dispute sits until the arbiter acts (see plans/08-disclosures.md).
+    /// disallowed dispute sits until the arbiter acts.
     function resolveDispute(uint256 jobId, bool sellerAtFault) external onlyArbiter {
         Job storage job = jobs[jobId];
         if (job.status != JobStatus.Disputed) revert JobNotDisputed(jobId, job.status);
@@ -387,7 +397,7 @@ contract JobEscrow {
             if (job.reservedBond > 0) {
                 sellerBond.slash(job.sellerAgentId, job.reservedBond, job.buyer);
             }
-            USDC.safeTransfer(job.buyer, job.amount);
+            _payOut(job.buyer, job.amount);
             // responseHash carries the buyer's actual dispute evidence hash here (not
             // bytes32(0), unlike the other three attestation call sites) — this is what
             // makes the at-fault attestation genuinely content-addressed and checkable by
@@ -399,7 +409,7 @@ contract JobEscrow {
             if (job.reservedBond > 0) {
                 sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
             }
-            USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
+            _payOut(job.sellerPayoutAddress, job.amount);
             _attestValidation(job.validationRequestHash, 100, bytes32(0), "DISPUTE_RESOLVED_SELLER");
         }
     }
@@ -420,7 +430,7 @@ contract JobEscrow {
         if (job.reservedBond > 0) {
             sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
         }
-        USDC.safeTransfer(job.sellerPayoutAddress, job.amount);
+        _payOut(job.sellerPayoutAddress, job.amount);
         // response=50, not 100: a timeout means the buyer simply never responded, not that
         // delivery was confirmed good. Scoring it identically to a real release() would
         // overclaim quality nobody actually verified; 50 reads as "indeterminate" on the

@@ -5,5 +5,11 @@ libs = ["lib"]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
 
+# BOT Chain testnet ("Bohr") — chain ID 968. Mainnet (chain ID 677, rpc.botchain.ai) is
+# deliberately not configured here: this project is testnet-only until the hackathon
+# submission is deployed and verified on bot_testnet.
+[profile.bot_testnet]
+chain_id = 968
+
 [rpc_endpoints]
-arc_testnet = "https://rpc.testnet.arc.network"
+bot_testnet = "https://rpc.bohr.life"

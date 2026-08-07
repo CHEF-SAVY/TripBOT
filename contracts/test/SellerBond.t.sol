@@ -3,17 +3,21 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {SellerBond} from "../src/SellerBond.sol";
-import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
+import {RejectingReceiver} from "./mocks/RejectingReceiver.sol";
 
 /// @title SellerBondTest — unit tests for SellerBond against mocked externals
-/// @notice Each function of SellerBond gets its own block of tests, added in the same
-/// change that implements the function. Naming follows the Foundry convention:
-/// `test_Description` for happy paths, `test_RevertWhen_Condition` for failure paths.
+/// @notice Each function of SellerBond gets its own block of tests. Naming follows the
+/// Foundry convention: `test_Description` for happy paths, `test_RevertWhen_Condition` for
+/// failure paths.
+///
+/// Stake moves as native BOT value here, not a pulled ERC-20 — deposit is `payable` and
+/// credits `msg.value`, and every payout goes out via a low-level `call`. There is no
+/// allowance concept anymore: a caller either sends enough value with the call or the call
+/// itself fails before SellerBond's logic ever runs.
 contract SellerBondTest is Test {
     // ------------------------------------------------------------------ fixtures
 
-    MockUSDC internal usdc;
     MockIdentityRegistry internal registry;
     SellerBond internal bond;
 
@@ -33,12 +37,12 @@ contract SellerBondTest is Test {
     /// gives it meaning. Chosen non-tiny so it can't accidentally collide with defaults.
     uint256 internal constant AGENT_ID = 851_889;
 
-    /// 100 USDC in 6-decimal units — a comfortable default stake for tests.
-    uint256 internal constant STAKE = 100e6;
+    /// A comfortable default stake for tests, in native BOT (18-decimal, like ETH).
+    uint256 internal constant STAKE = 100 ether;
 
-    /// 40 USDC — a partial withdrawal, deliberately smaller than STAKE so tests can
-    /// assert the *remaining* bond stays intact and free.
-    uint256 internal constant WITHDRAW = 40e6;
+    /// A partial withdrawal, deliberately smaller than STAKE so tests can assert the
+    /// *remaining* bond stays intact and free.
+    uint256 internal constant WITHDRAW = 40 ether;
 
     /// Mirror of the events under test. Solidity events can't be imported standalone, so
     /// tests re-declare them to use with vm.expectEmit.
@@ -50,48 +54,40 @@ contract SellerBondTest is Test {
     event ReservationReleased(uint256 indexed agentId, uint256 amount);
     event Slashed(uint256 indexed agentId, address indexed recipient, uint256 amount);
 
-    /// Fresh state before every test: new token, new registry, new SellerBond wired to
-    /// them, one registered agent owned by `seller`, who holds STAKE USDC and has already
-    /// approved the bond contract (the approve step is a precondition of deposit, not the
-    /// behaviour under test).
+    /// Fresh state before every test: new registry, new SellerBond wired to it, one
+    /// registered agent owned by `seller`, who holds plenty of native BOT to stake.
     function setUp() public {
-        usdc = new MockUSDC();
         registry = new MockIdentityRegistry();
-        bond = new SellerBond(address(usdc), address(registry), jobEscrow);
+        bond = new SellerBond(address(registry), jobEscrow);
 
         registry.setAgentOwner(AGENT_ID, seller);
-        usdc.mint(seller, STAKE);
-        vm.prank(seller); // next call executes as `seller`
-        usdc.approve(address(bond), type(uint256).max);
+        vm.deal(seller, 10_000 ether);
     }
 
     // ------------------------------------------------------------------ deposit
 
-    /// The core happy path: money moves in, bookkeeping matches, event fires.
-    function test_DepositCreditsBondAndPullsUSDC() public {
+    /// The core happy path: value moves in, bookkeeping matches, event fires.
+    function test_DepositCreditsBondAndHoldsNativeValue() public {
         // expectEmit arms a check that the *next* call emits exactly this event.
         vm.expectEmit(true, true, false, true);
         emit Deposited(AGENT_ID, seller, STAKE);
 
         vm.prank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
 
         // Bookkeeping: the agent's gross bond reflects the deposit...
         assertEq(bond.bondBalance(AGENT_ID), STAKE, "bond not credited");
         // ...and with nothing reserved or pending, all of it is free.
         assertEq(bond.bondOf(AGENT_ID), STAKE, "free bond should equal gross");
-        // Custody: the tokens physically moved from seller to the contract.
-        assertEq(usdc.balanceOf(address(bond)), STAKE, "contract should hold the stake");
-        assertEq(usdc.balanceOf(seller), 0, "seller should have paid the stake");
+        // Custody: the value physically moved from seller to the contract.
+        assertEq(address(bond).balance, STAKE, "contract should hold the stake");
     }
 
     /// Deposits accumulate — a second deposit adds to, not replaces, the first.
     function test_DepositAccumulatesAcrossCalls() public {
-        usdc.mint(seller, STAKE); // top the seller back up for a second deposit
-
         vm.startPrank(seller); // every call until stopPrank executes as `seller`
-        bond.deposit(AGENT_ID, STAKE);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
+        bond.deposit{value: STAKE}(AGENT_ID);
         vm.stopPrank();
 
         assertEq(bond.bondBalance(AGENT_ID), 2 * STAKE, "deposits should accumulate");
@@ -101,11 +97,9 @@ contract SellerBondTest is Test {
     /// operator" is exactly the authority the Identity Registry models.
     function test_DepositByApprovedOperator() public {
         registry.setOperator(AGENT_ID, operator, true);
-        usdc.mint(operator, STAKE);
-        vm.startPrank(operator);
-        usdc.approve(address(bond), STAKE);
-        bond.deposit(AGENT_ID, STAKE);
-        vm.stopPrank();
+        vm.deal(operator, STAKE);
+        vm.prank(operator);
+        bond.deposit{value: STAKE}(AGENT_ID);
 
         assertEq(bond.bondBalance(AGENT_ID), STAKE, "operator deposit should credit bond");
     }
@@ -113,14 +107,12 @@ contract SellerBondTest is Test {
     /// A wallet with no relationship to the agent must be rejected — the bond must be
     /// the seller's own stake (the project's core economic promise).
     function test_RevertWhen_DepositorIsNotOwnerOrOperator() public {
-        usdc.mint(stranger, STAKE);
-        vm.startPrank(stranger);
-        usdc.approve(address(bond), STAKE);
+        vm.deal(stranger, STAKE);
+        vm.prank(stranger);
         // expectRevert checks the *next* call reverts with exactly this custom error and
         // arguments — asserting the caller and agent are reported back correctly.
         vm.expectRevert(abi.encodeWithSelector(SellerBond.NotAgentOwnerOrOperator.selector, AGENT_ID, stranger));
-        bond.deposit(AGENT_ID, STAKE);
-        vm.stopPrank();
+        bond.deposit{value: STAKE}(AGENT_ID);
     }
 
     /// Depositing to an agent id that was never registered must revert — the registry's
@@ -129,27 +121,14 @@ contract SellerBondTest is Test {
         uint256 ghostAgent = 999_999;
         vm.prank(seller);
         vm.expectRevert(abi.encodeWithSelector(MockIdentityRegistry.NonexistentAgent.selector, ghostAgent));
-        bond.deposit(ghostAgent, STAKE);
+        bond.deposit{value: STAKE}(ghostAgent);
     }
 
     /// Zero-amount deposits are rejected outright.
     function test_RevertWhen_DepositZero() public {
         vm.prank(seller);
         vm.expectRevert(SellerBond.ZeroAmount.selector);
-        bond.deposit(AGENT_ID, 0);
-    }
-
-    /// Without an allowance the token itself aborts the pull — proving deposit cannot
-    /// credit bond it never received.
-    function test_RevertWhen_DepositWithoutAllowance() public {
-        vm.prank(seller);
-        usdc.approve(address(bond), 0); // cancel setUp's blanket approval
-
-        vm.prank(seller);
-        vm.expectRevert(); // exact error comes from OZ's ERC20; its shape isn't ours to pin
-        bond.deposit(AGENT_ID, STAKE);
-
-        assertEq(bond.bondBalance(AGENT_ID), 0, "failed pull must not credit bond");
+        bond.deposit{value: 0}(AGENT_ID);
     }
 
     // ------------------------------------------------------------------ bondOf
@@ -163,12 +142,12 @@ contract SellerBondTest is Test {
     /// or pending. (The interesting netting cases arrive with requestWithdrawal/reserve —
     /// tested alongside those functions.)
     function testFuzz_BondOfEqualsBalanceWhenNothingLocked(uint256 amount) public {
-        // bound() constrains the fuzzed input to a sane range (1 wei .. 1B USDC) —
+        // bound() constrains the fuzzed input to a sane range (1 wei .. 1M BOT) —
         // preferred over vm.assume per Foundry best practices.
-        amount = bound(amount, 1, 1e15);
-        usdc.mint(seller, amount);
+        amount = bound(amount, 1, 1e24);
+        vm.deal(seller, amount);
         vm.prank(seller);
-        bond.deposit(AGENT_ID, amount);
+        bond.deposit{value: amount}(AGENT_ID);
         assertEq(bond.bondOf(AGENT_ID), bond.bondBalance(AGENT_ID));
     }
 
@@ -180,7 +159,7 @@ contract SellerBondTest is Test {
     /// `block.timestamp + timelock` arithmetic in every test body.
     function _depositAndRequest() internal returns (uint64 unlockTime) {
         vm.startPrank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
         bond.requestWithdrawal(AGENT_ID, WITHDRAW);
         vm.stopPrank();
         (, unlockTime) = bond.pendingWithdrawal(AGENT_ID);
@@ -193,7 +172,7 @@ contract SellerBondTest is Test {
     /// completion).
     function test_RequestWithdrawalSnapshotsUnlockAndReducesFreeBond() public {
         vm.prank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
 
         uint64 expectedUnlock = uint64(block.timestamp) + bond.withdrawalTimelock();
         vm.expectEmit(true, false, false, true);
@@ -204,7 +183,7 @@ contract SellerBondTest is Test {
 
         // Free bond drops NOW — this is what stops JobEscrow reserving exiting funds...
         assertEq(bond.bondOf(AGENT_ID), STAKE - WITHDRAW, "free bond should shrink at request time");
-        // ...but the tokens themselves haven't moved yet.
+        // ...but the value itself hasn't moved yet.
         assertEq(bond.bondBalance(AGENT_ID), STAKE, "gross bond untouched until completion");
         (uint256 amount, uint64 unlockTime) = bond.pendingWithdrawal(AGENT_ID);
         assertEq(amount, WITHDRAW, "pending amount recorded");
@@ -215,7 +194,7 @@ contract SellerBondTest is Test {
     /// (they can never redirect its payout — see the completion tests).
     function test_RequestWithdrawalByOperator() public {
         vm.prank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
         registry.setOperator(AGENT_ID, operator, true);
 
         vm.prank(operator);
@@ -228,7 +207,7 @@ contract SellerBondTest is Test {
     /// A wallet with no relationship to the agent can't start pulling its stake out.
     function test_RevertWhen_RequestWithdrawalByStranger() public {
         vm.prank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
 
         vm.prank(stranger);
         vm.expectRevert(abi.encodeWithSelector(SellerBond.NotAgentOwnerOrOperator.selector, AGENT_ID, stranger));
@@ -246,7 +225,7 @@ contract SellerBondTest is Test {
     /// Can't request more than the free bond — the error reports what was actually free.
     function test_RevertWhen_RequestWithdrawalExceedsFreeBond() public {
         vm.prank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
 
         vm.prank(seller);
         vm.expectRevert(abi.encodeWithSelector(SellerBond.InsufficientBond.selector, AGENT_ID, STAKE + 1, STAKE));
@@ -276,7 +255,7 @@ contract SellerBondTest is Test {
     function testFuzz_RequestWithdrawalNettingHolds(uint256 amount) public {
         amount = bound(amount, 1, STAKE);
         vm.startPrank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
         bond.requestWithdrawal(AGENT_ID, amount);
         vm.stopPrank();
 
@@ -297,12 +276,13 @@ contract SellerBondTest is Test {
         bond.completeWithdrawal(AGENT_ID);
     }
 
-    /// Happy path at maturity: tokens return to the owner, the request clears, gross bond
-    /// drops — and free bond is UNCHANGED, because it already excluded the pending amount
-    /// from the moment of the request.
+    /// Happy path at maturity: native value returns to the owner, the request clears,
+    /// gross bond drops — and free bond is UNCHANGED, because it already excluded the
+    /// pending amount from the moment of the request.
     function test_CompleteWithdrawalPaysOwnerAndClearsRequest() public {
         uint64 unlockTime = _depositAndRequest();
         uint256 freeBefore = bond.bondOf(AGENT_ID);
+        uint256 sellerBalanceBefore = seller.balance;
 
         vm.warp(unlockTime);
         vm.expectEmit(true, true, false, true);
@@ -311,8 +291,8 @@ contract SellerBondTest is Test {
         vm.prank(seller);
         bond.completeWithdrawal(AGENT_ID);
 
-        assertEq(usdc.balanceOf(seller), WITHDRAW, "owner should receive the withdrawal");
-        assertEq(usdc.balanceOf(address(bond)), STAKE - WITHDRAW, "contract custody should shrink");
+        assertEq(seller.balance, sellerBalanceBefore + WITHDRAW, "owner should receive the withdrawal");
+        assertEq(address(bond).balance, STAKE - WITHDRAW, "contract custody should shrink");
         assertEq(bond.bondBalance(AGENT_ID), STAKE - WITHDRAW, "gross bond should shrink");
         assertEq(bond.bondOf(AGENT_ID), freeBefore, "free bond must not change at completion");
         (uint256 amount,) = bond.pendingWithdrawal(AGENT_ID);
@@ -324,27 +304,29 @@ contract SellerBondTest is Test {
     function test_CompleteTriggeredByOperatorStillPaysOwner() public {
         uint64 unlockTime = _depositAndRequest();
         registry.setOperator(AGENT_ID, operator, true);
+        uint256 sellerBalanceBefore = seller.balance;
 
         vm.warp(unlockTime);
         vm.prank(operator);
         bond.completeWithdrawal(AGENT_ID);
 
-        assertEq(usdc.balanceOf(seller), WITHDRAW, "payout goes to the owner");
-        assertEq(usdc.balanceOf(operator), 0, "operator must receive nothing");
+        assertEq(seller.balance, sellerBalanceBefore + WITHDRAW, "payout goes to the owner");
+        assertEq(operator.balance, 0, "operator must receive nothing");
     }
 
     /// If the agent NFT changes wallets mid-timelock, the *current* owner at completion
     /// time is paid — stake travels with the agent, exactly like reputation does.
     function test_CompleteAfterAgentTransferPaysNewOwner() public {
         uint64 unlockTime = _depositAndRequest();
+        uint256 sellerBalanceBefore = seller.balance;
         registry.setAgentOwner(AGENT_ID, newOwner); // simulate the ERC-721 transfer
 
         vm.warp(unlockTime);
         vm.prank(newOwner); // old owner lost authorization along with the NFT
         bond.completeWithdrawal(AGENT_ID);
 
-        assertEq(usdc.balanceOf(newOwner), WITHDRAW, "new owner should receive the stake");
-        assertEq(usdc.balanceOf(seller), 0, "previous owner should receive nothing");
+        assertEq(newOwner.balance, WITHDRAW, "new owner should receive the stake");
+        assertEq(seller.balance, sellerBalanceBefore, "previous owner should receive nothing");
     }
 
     /// Completing with no request in flight is a distinct, descriptive error.
@@ -354,12 +336,35 @@ contract SellerBondTest is Test {
         bond.completeWithdrawal(AGENT_ID);
     }
 
+    /// If the current owner can't receive native value (e.g. a contract with no
+    /// receive/fallback), the whole withdrawal must revert rather than silently burning the
+    /// seller's stake — the same "money must move or nothing happens" guarantee SafeERC20
+    /// gave the USDC version, now enforced by NativeTransferFailed instead.
+    function test_RevertWhen_CompleteWithdrawalRecipientRejectsValue() public {
+        RejectingReceiver rejecting = new RejectingReceiver();
+        registry.setAgentOwner(AGENT_ID, address(rejecting));
+        vm.deal(address(rejecting), STAKE);
+
+        vm.startPrank(address(rejecting));
+        bond.deposit{value: STAKE}(AGENT_ID);
+        bond.requestWithdrawal(AGENT_ID, WITHDRAW);
+        vm.stopPrank();
+
+        (, uint64 unlockTime) = bond.pendingWithdrawal(AGENT_ID);
+        vm.warp(unlockTime);
+
+        vm.prank(address(rejecting));
+        vm.expectRevert(abi.encodeWithSelector(SellerBond.NativeTransferFailed.selector, address(rejecting), WITHDRAW));
+        bond.completeWithdrawal(AGENT_ID);
+    }
+
     // ---------------------------------------------------- setWithdrawalTimelock
 
     /// The plan's invariant 4: a global timelock change never retroactively touches an
     /// in-flight request — shortening to zero doesn't spring the old lock early.
     function test_TimelockChangeDoesNotAffectPendingRequest() public {
         uint64 unlockTime = _depositAndRequest();
+        uint256 sellerBalanceBefore = seller.balance;
 
         // The test contract deployed SellerBond in setUp, so it IS the owner here.
         bond.setWithdrawalTimelock(0);
@@ -374,20 +379,23 @@ contract SellerBondTest is Test {
         vm.warp(unlockTime);
         vm.prank(seller);
         bond.completeWithdrawal(AGENT_ID);
-        assertEq(usdc.balanceOf(seller), WITHDRAW, "original schedule should still pay out");
+        assertEq(seller.balance, sellerBalanceBefore + WITHDRAW, "original schedule should still pay out");
     }
 
     /// The flip side: a request made AFTER the change uses the new timelock — here zero,
     /// so it matures immediately (the demo-recording configuration).
     function test_NewRequestUsesUpdatedTimelock() public {
         bond.setWithdrawalTimelock(0);
+        uint256 sellerBalanceBefore = seller.balance;
         vm.startPrank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
         bond.requestWithdrawal(AGENT_ID, WITHDRAW);
         bond.completeWithdrawal(AGENT_ID); // no warp: unlockTime == now
         vm.stopPrank();
 
-        assertEq(usdc.balanceOf(seller), WITHDRAW, "zero timelock should allow immediate completion");
+        assertEq(
+            seller.balance, sellerBalanceBefore - STAKE + WITHDRAW, "zero timelock should allow immediate completion"
+        );
     }
 
     /// Setter happy path: event reports old and new values, state updates.
@@ -419,10 +427,10 @@ contract SellerBondTest is Test {
     /// JobEscrow-only surface, not the withdrawal one.
     function _deposit() internal {
         vm.prank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
     }
 
-    /// Reserving moves bond from "free" to "locked" without moving any tokens — bondOf()
+    /// Reserving moves bond from "free" to "locked" without moving any value — bondOf()
     /// drops by exactly the reserved amount, the balance sheet total is untouched.
     function test_ReserveLocksFreeBond() public {
         _deposit();
@@ -467,7 +475,7 @@ contract SellerBondTest is Test {
     /// bond across a live job and an in-flight withdrawal request.
     function test_ReserveRespectsAlreadyPendingWithdrawal() public {
         vm.startPrank(seller);
-        bond.deposit(AGENT_ID, STAKE);
+        bond.deposit{value: STAKE}(AGENT_ID);
         bond.requestWithdrawal(AGENT_ID, WITHDRAW); // free bond now STAKE - WITHDRAW
         vm.stopPrank();
 
@@ -477,7 +485,7 @@ contract SellerBondTest is Test {
         bond.reserve(AGENT_ID, free + 1);
     }
 
-    /// Releasing a reservation frees bookkeeping room without moving tokens — the mirror
+    /// Releasing a reservation frees bookkeeping room without moving value — the mirror
     /// image of `reserve`.
     function test_ReleaseReservationUnlocksBond() public {
         _deposit();
@@ -523,8 +531,8 @@ contract SellerBondTest is Test {
         bond.releaseReservation(AGENT_ID, WITHDRAW + 1);
     }
 
-    /// The other half of the pitch: a slash actually moves USDC to the wronged buyer and
-    /// permanently removes it from the seller's stake — both the gross balance and the
+    /// The other half of the pitch: a slash actually moves native BOT to the wronged buyer
+    /// and permanently removes it from the seller's stake — both the gross balance and the
     /// reservation drop together, so the confiscated amount can never resurface.
     function test_SlashTransfersToRecipientAndDecrementsBoth() public {
         _deposit();
@@ -536,7 +544,7 @@ contract SellerBondTest is Test {
         vm.prank(jobEscrow);
         bond.slash(AGENT_ID, WITHDRAW, buyer);
 
-        assertEq(usdc.balanceOf(buyer), WITHDRAW, "slashed funds should reach the wronged buyer");
+        assertEq(buyer.balance, WITHDRAW, "slashed funds should reach the wronged buyer");
         assertEq(bond.reserved(AGENT_ID), 0, "reservation is consumed by the slash");
         assertEq(bond.bondBalance(AGENT_ID), STAKE - WITHDRAW, "gross stake should permanently shrink");
     }

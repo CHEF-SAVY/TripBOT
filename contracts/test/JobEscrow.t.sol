@@ -4,26 +4,26 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {JobEscrow} from "../src/JobEscrow.sol";
 import {SellerBond} from "../src/SellerBond.sol";
-import {MockUSDC} from "./mocks/MockUSDC.sol";
 import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
 import {MockValidationRegistry} from "./mocks/MockValidationRegistry.sol";
 
 /// @title JobEscrowTest — unit tests for JobEscrow against mocked externals + a real SellerBond
-/// @notice SellerBond is real (not mocked) here on purpose: plan 05's test list wants
-/// createJob's insufficient-bond revert to come from SellerBond.reserve() itself, not a
-/// duplicate check in JobEscrow — so the test needs the actual reservation accounting, not a
-/// stand-in. Only the Identity Registry and USDC are mocked.
+/// @notice SellerBond is real (not mocked) here on purpose: createJob's insufficient-bond
+/// revert should come from SellerBond.reserve() itself, not a duplicate check in JobEscrow —
+/// so the test needs the actual reservation accounting, not a stand-in. Only the Identity
+/// Registry and Validation Registry are mocked.
 ///
-/// validationRegistryEnabled defaults true on JobEscrow itself, but every pre-Phase-3 test in
-/// this file was written passing bytes32(0) as validationRequestHash, from back when the flag
-/// had no effect. Rather than registering a real hash at all 30+ of those call sites, setUp()
-/// disables the flag once so their original behavior is preserved unchanged; the
-/// Validation-Registry-specific tests re-enable it deliberately and use
-/// _createJobWithValidHash.
+/// The escrowed amount is native BOT value (`msg.value` at createJob time), not a pulled
+/// ERC-20 — createJob is `payable` and no longer takes an `amount` parameter.
+///
+/// validationRegistryEnabled defaults true on JobEscrow itself, but every test in this file
+/// not specifically about the Validation Registry passes bytes32(0) as validationRequestHash,
+/// from back when the flag had no effect on this suite. setUp() disables the flag once so
+/// their original behavior is preserved unchanged; the Validation-Registry-specific tests
+/// re-enable it deliberately and use _createJobWithValidHash.
 contract JobEscrowTest is Test {
     // ------------------------------------------------------------------ fixtures
 
-    MockUSDC internal usdc;
     MockIdentityRegistry internal registry;
     MockValidationRegistry internal validationRegistry;
     JobEscrow internal jobEscrow;
@@ -36,11 +36,11 @@ contract JobEscrowTest is Test {
 
     uint256 internal constant SELLER_AGENT_ID = 851_889;
 
-    /// 500 USDC job; at the default 20% minBondRatioBps that's a 100 USDC reservation.
-    uint256 internal constant AMOUNT = 500e6;
-    uint256 internal constant REQUIRED_BOND = 100e6;
+    /// 500 BOT job; at the default 20% minBondRatioBps that's a 100 BOT reservation.
+    uint256 internal constant AMOUNT = 500 ether;
+    uint256 internal constant REQUIRED_BOND = 100 ether;
     /// Comfortably more than REQUIRED_BOND, so a single job leaves room to spare.
-    uint256 internal constant SELLER_STAKE = 200e6;
+    uint256 internal constant SELLER_STAKE = 200 ether;
 
     uint64 internal completionDeadline;
 
@@ -67,29 +67,24 @@ contract JobEscrowTest is Test {
 
     /// Fresh state before every test: the full two-step deploy (JobEscrow first, then
     /// SellerBond with JobEscrow's address baked in, then setSellerBond wires them together),
-    /// one registered seller agent with SELLER_STAKE already posted, one funded buyer who has
-    /// already approved JobEscrow to pull USDC.
+    /// one registered seller agent with SELLER_STAKE already posted, one buyer funded with
+    /// native BOT.
     function setUp() public {
-        usdc = new MockUSDC();
         registry = new MockIdentityRegistry();
         validationRegistry = new MockValidationRegistry();
-        jobEscrow = new JobEscrow(address(usdc), address(registry), address(validationRegistry), arbiter);
-        sellerBond = new SellerBond(address(usdc), address(registry), address(jobEscrow));
+        jobEscrow = new JobEscrow(address(registry), address(validationRegistry), arbiter);
+        sellerBond = new SellerBond(address(registry), address(jobEscrow));
         jobEscrow.setSellerBond(address(sellerBond));
-        // Restores pre-Phase-3 behavior for every existing bytes32(0)-hash test — see the
-        // contract-level @notice above.
+        // Restores pre-Validation-Registry behavior for every existing bytes32(0)-hash test —
+        // see the contract-level @notice above.
         jobEscrow.setValidationRegistryEnabled(false);
 
         registry.setAgentOwner(SELLER_AGENT_ID, seller);
-        usdc.mint(seller, SELLER_STAKE);
-        vm.startPrank(seller);
-        usdc.approve(address(sellerBond), SELLER_STAKE);
-        sellerBond.deposit(SELLER_AGENT_ID, SELLER_STAKE);
-        vm.stopPrank();
+        vm.deal(seller, SELLER_STAKE);
+        vm.prank(seller);
+        sellerBond.deposit{value: SELLER_STAKE}(SELLER_AGENT_ID);
 
-        usdc.mint(buyer, AMOUNT);
-        vm.prank(buyer);
-        usdc.approve(address(jobEscrow), AMOUNT);
+        vm.deal(buyer, 1000 ether);
 
         completionDeadline = uint64(block.timestamp) + 1 days;
     }
@@ -97,8 +92,8 @@ contract JobEscrowTest is Test {
     // ------------------------------------------------------------------ setSellerBond
 
     function test_SetSellerBondWiresAddressAndEmits() public {
-        JobEscrow fresh = new JobEscrow(address(usdc), address(registry), address(validationRegistry), arbiter);
-        SellerBond freshBond = new SellerBond(address(usdc), address(registry), address(fresh));
+        JobEscrow fresh = new JobEscrow(address(registry), address(validationRegistry), arbiter);
+        SellerBond freshBond = new SellerBond(address(registry), address(fresh));
 
         vm.expectEmit(false, false, false, true);
         emit SellerBondSet(address(freshBond));
@@ -108,7 +103,7 @@ contract JobEscrowTest is Test {
     }
 
     function test_RevertWhen_SetSellerBondByNonOwner() public {
-        JobEscrow fresh = new JobEscrow(address(usdc), address(registry), address(validationRegistry), arbiter);
+        JobEscrow fresh = new JobEscrow(address(registry), address(validationRegistry), arbiter);
         vm.prank(stranger);
         vm.expectRevert(JobEscrow.NotOwner.selector);
         fresh.setSellerBond(makeAddr("someSellerBond"));
@@ -123,14 +118,14 @@ contract JobEscrowTest is Test {
 
     // ------------------------------------------------------------------ createJob
 
-    /// The core happy path: bond reserved on SellerBond, USDC pulled into escrow, Job struct
+    /// The core happy path: bond reserved on SellerBond, native BOT escrowed, Job struct
     /// recorded correctly, event emitted with the exact reservedBond that was computed.
-    function test_CreateJobReservesBondAndPullsUSDC() public {
+    function test_CreateJobReservesBondAndEscrowsValue() public {
         vm.expectEmit(true, true, true, true);
         emit JobCreated(0, buyer, SELLER_AGENT_ID, AMOUNT, REQUIRED_BOND, completionDeadline);
 
         vm.prank(buyer);
-        uint256 jobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
+        uint256 jobId = jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
 
         assertEq(jobId, 0, "first job should be id 0");
         assertEq(jobEscrow.nextJobId(), 1, "nextJobId should advance");
@@ -159,61 +154,57 @@ contract JobEscrowTest is Test {
         assertEq(uint8(status), uint8(JobEscrow.JobStatus.Active), "job should start Active");
 
         assertEq(sellerBond.reserved(SELLER_AGENT_ID), REQUIRED_BOND, "SellerBond should show the reservation");
-        assertEq(usdc.balanceOf(address(jobEscrow)), AMOUNT, "escrow should hold the buyer's payment");
-        assertEq(usdc.balanceOf(buyer), 0, "buyer should have paid the full amount");
+        assertEq(address(jobEscrow).balance, AMOUNT, "escrow should hold the buyer's payment");
     }
 
     /// A second job gets the next sequential id — jobIds aren't reused or randomized.
     function test_CreateJobIncrementsJobId() public {
-        usdc.mint(buyer, 2 * AMOUNT); // setUp only funded/approved enough for one job
-        usdc.mint(seller, SELLER_STAKE);
-        vm.startPrank(buyer);
-        usdc.approve(address(jobEscrow), 2 * AMOUNT); // approve() sets, not adds — cover both jobs up front
-        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
-        vm.stopPrank();
-        vm.startPrank(seller);
-        usdc.approve(address(sellerBond), SELLER_STAKE);
-        sellerBond.deposit(SELLER_AGENT_ID, SELLER_STAKE); // top up: two jobs need 2x REQUIRED_BOND reserved
-        vm.stopPrank();
+        vm.deal(seller, SELLER_STAKE); // top up: two jobs need 2x REQUIRED_BOND reserved
+        vm.prank(seller);
+        sellerBond.deposit{value: SELLER_STAKE}(SELLER_AGENT_ID);
 
         vm.prank(buyer);
-        uint256 secondJobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
+
+        vm.prank(buyer);
+        uint256 secondJobId = jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
         assertEq(secondJobId, 1, "second job should be id 1");
     }
 
     function test_RevertWhen_CreateJobZeroAmount() public {
         vm.prank(buyer);
         vm.expectRevert(JobEscrow.ZeroAmount.selector);
-        jobEscrow.createJob(SELLER_AGENT_ID, 0, completionDeadline, bytes32(0));
+        jobEscrow.createJob{value: 0}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
     }
 
     function test_RevertWhen_CreateJobDeadlineNotInFuture() public {
         uint64 pastDeadline = uint64(block.timestamp);
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(JobEscrow.DeadlineNotInFuture.selector, pastDeadline));
-        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, pastDeadline, bytes32(0));
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, pastDeadline, bytes32(0));
     }
 
     /// createJob must fail cleanly, not silently escrow funds with no bond backing them, if
     /// the two-step deploy's wiring call was never made.
     function test_RevertWhen_CreateJobSellerBondNotSet() public {
-        JobEscrow unwired = new JobEscrow(address(usdc), address(registry), address(validationRegistry), arbiter);
+        JobEscrow unwired = new JobEscrow(address(registry), address(validationRegistry), arbiter);
         vm.prank(buyer);
         vm.expectRevert(JobEscrow.SellerBondNotSet.selector);
-        unwired.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
+        unwired.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
     }
 
     /// The property the reservation design exists for: JobEscrow doesn't duplicate a ratio
     /// check, it just lets SellerBond.reserve()'s own revert propagate.
     function test_RevertWhen_CreateJobInsufficientBond() public {
         uint256 tooLarge = SELLER_STAKE * 100; // 20% of this dwarfs what the seller posted
+        vm.deal(buyer, tooLarge);
         vm.prank(buyer);
         vm.expectRevert(
             abi.encodeWithSelector(
                 SellerBond.InsufficientBond.selector, SELLER_AGENT_ID, (tooLarge * 2000) / 10_000, SELLER_STAKE
             )
         );
-        jobEscrow.createJob(SELLER_AGENT_ID, tooLarge, completionDeadline, bytes32(0));
+        jobEscrow.createJob{value: tooLarge}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
     }
 
     /// A seller agentId that was never registered must revert — ownerOf's own revert doubles
@@ -222,7 +213,7 @@ contract JobEscrowTest is Test {
         uint256 ghostAgent = 999_999;
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(MockIdentityRegistry.NonexistentAgent.selector, ghostAgent));
-        jobEscrow.createJob(ghostAgent, AMOUNT, completionDeadline, bytes32(0));
+        jobEscrow.createJob{value: AMOUNT}(ghostAgent, completionDeadline, bytes32(0));
     }
 
     // ---------------------------------------------------- createJob validation registry gate
@@ -244,7 +235,7 @@ contract JobEscrowTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(JobEscrow.ValidationRequestInvalid.selector, requestHash, SELLER_AGENT_ID)
         );
-        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, requestHash);
     }
 
     /// A requestHash that's registered, but names some other address as validator, must not
@@ -259,7 +250,7 @@ contract JobEscrowTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(JobEscrow.ValidationRequestInvalid.selector, requestHash, SELLER_AGENT_ID)
         );
-        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, requestHash);
     }
 
     /// A requestHash already claimed by one job must not back a second one — without this,
@@ -271,7 +262,7 @@ contract JobEscrowTest is Test {
 
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(JobEscrow.ValidationRequestHashAlreadyUsed.selector, requestHash));
-        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, requestHash);
     }
 
     /// Two distinct, independently-registered hashes for the same seller must both work —
@@ -279,15 +270,11 @@ contract JobEscrowTest is Test {
     function test_CreateJobSucceedsWithTwoDistinctHashesForSameSeller() public {
         uint256 jobId1 = _createJobWithValidHash(keccak256("distinct-hash-one"));
 
-        // A second job needs its own USDC allowance and enough free bond — top up both.
-        usdc.mint(buyer, AMOUNT);
-        vm.prank(buyer);
-        usdc.approve(address(jobEscrow), AMOUNT);
-        usdc.mint(seller, REQUIRED_BOND);
-        vm.startPrank(seller);
-        usdc.approve(address(sellerBond), REQUIRED_BOND);
-        sellerBond.deposit(SELLER_AGENT_ID, REQUIRED_BOND);
-        vm.stopPrank();
+        // A second job needs its own native value and enough free bond — top up both.
+        vm.deal(buyer, AMOUNT);
+        vm.deal(seller, REQUIRED_BOND);
+        vm.prank(seller);
+        sellerBond.deposit{value: REQUIRED_BOND}(SELLER_AGENT_ID);
 
         uint256 jobId2 = _createJobWithValidHash(keccak256("distinct-hash-two"));
         assertTrue(jobId2 != jobId1, "should be two distinct jobs");
@@ -297,7 +284,7 @@ contract JobEscrowTest is Test {
 
     function _createJob() internal returns (uint256 jobId) {
         vm.prank(buyer);
-        jobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
+        jobId = jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
     }
 
     /// Like _createJob, but with validationRegistryEnabled turned on and a real hash
@@ -307,7 +294,7 @@ contract JobEscrowTest is Test {
         jobEscrow.setValidationRegistryEnabled(true);
         validationRegistry.validationRequest(address(jobEscrow), SELLER_AGENT_ID, "", requestHash);
         vm.prank(buyer);
-        jobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, requestHash);
+        jobId = jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, requestHash);
     }
 
     /// The core happy path: seller gets paid in full, the reservation is released back to
@@ -320,7 +307,7 @@ contract JobEscrowTest is Test {
         vm.prank(buyer);
         jobEscrow.release(jobId);
 
-        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should be paid in full");
+        assertEq(seller.balance, AMOUNT, "seller should be paid in full");
         assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "reservation should be released");
         assertEq(sellerBond.bondOf(SELLER_AGENT_ID), SELLER_STAKE, "seller's full stake should be free again");
 
@@ -334,7 +321,7 @@ contract JobEscrowTest is Test {
         uint256 jobId = _createJob();
         vm.prank(buyer);
         jobEscrow.release(jobId); // no warp — should succeed right away
-        assertEq(usdc.balanceOf(seller), AMOUNT, "release should succeed before the deadline");
+        assertEq(seller.balance, AMOUNT, "release should succeed before the deadline");
     }
 
     function test_RevertWhen_ReleaseByNonBuyer() public {
@@ -381,7 +368,7 @@ contract JobEscrowTest is Test {
         (,,,,,,, JobEscrow.JobStatus status,, bytes32 evidenceHash) = jobEscrow.jobs(jobId);
         assertEq(uint8(status), uint8(JobEscrow.JobStatus.Disputed), "status should be Disputed");
         assertEq(evidenceHash, EVIDENCE_HASH, "evidenceHash should be recorded");
-        assertEq(usdc.balanceOf(address(jobEscrow)), AMOUNT, "escrow should still hold the payment");
+        assertEq(address(jobEscrow).balance, AMOUNT, "escrow should still hold the payment");
         assertEq(sellerBond.reserved(SELLER_AGENT_ID), REQUIRED_BOND, "reservation should still be locked");
     }
 
@@ -427,13 +414,18 @@ contract JobEscrowTest is Test {
     /// slashed bond straight from SellerBond — and the seller's stake permanently shrinks.
     function test_ResolveDisputeSellerAtFaultSlashesBondAndRefundsBuyer() public {
         uint256 jobId = _createAndDisputeJob();
+        uint256 buyerBalanceBefore = buyer.balance;
 
         vm.expectEmit(true, false, false, true);
         emit JobResolved(jobId, true);
         vm.prank(arbiter);
         jobEscrow.resolveDispute(jobId, true);
 
-        assertEq(usdc.balanceOf(buyer), AMOUNT + REQUIRED_BOND, "buyer should get the refund plus the slashed bond");
+        assertEq(
+            buyer.balance,
+            buyerBalanceBefore + AMOUNT + REQUIRED_BOND,
+            "buyer should get the refund plus the slashed bond"
+        );
         assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "reservation should be consumed by the slash");
         assertEq(
             sellerBond.bondOf(SELLER_AGENT_ID), SELLER_STAKE - REQUIRED_BOND, "seller's stake should permanently shrink"
@@ -450,7 +442,7 @@ contract JobEscrowTest is Test {
         vm.prank(arbiter);
         jobEscrow.resolveDispute(jobId, false);
 
-        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should be paid in full");
+        assertEq(seller.balance, AMOUNT, "seller should be paid in full");
         assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "reservation should be released, not slashed");
         assertEq(sellerBond.bondOf(SELLER_AGENT_ID), SELLER_STAKE, "seller's full stake should be free again");
     }
@@ -484,7 +476,7 @@ contract JobEscrowTest is Test {
         vm.prank(stranger);
         jobEscrow.claimTimeout(jobId);
 
-        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should be paid in full");
+        assertEq(seller.balance, AMOUNT, "seller should be paid in full");
         assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "reservation should be released");
 
         (,,,,,,, JobEscrow.JobStatus status,,) = jobEscrow.jobs(jobId);
@@ -632,7 +624,7 @@ contract JobEscrowTest is Test {
         vm.prank(buyer);
         jobEscrow.release(jobId);
 
-        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should still be paid despite the reverting attestation");
+        assertEq(seller.balance, AMOUNT, "seller should still be paid despite the reverting attestation");
     }
 
     /// resolveDispute(sellerAtFault=true) writes response=0, the buyer's real evidenceHash
@@ -662,13 +654,14 @@ contract JobEscrowTest is Test {
         vm.prank(buyer);
         jobEscrow.dispute(jobId, EVIDENCE_HASH);
         validationRegistry.setAlwaysRevertOnResponse(requestHash);
+        uint256 buyerBalanceBefore = buyer.balance;
 
         vm.prank(arbiter);
         jobEscrow.resolveDispute(jobId, true);
 
         assertEq(
-            usdc.balanceOf(buyer),
-            AMOUNT + REQUIRED_BOND,
+            buyer.balance,
+            buyerBalanceBefore + AMOUNT + REQUIRED_BOND,
             "buyer should still get the refund plus the slashed bond despite the reverting attestation"
         );
     }
@@ -719,7 +712,7 @@ contract JobEscrowTest is Test {
 
         jobEscrow.claimTimeout(jobId);
 
-        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should still be paid despite the reverting attestation");
+        assertEq(seller.balance, AMOUNT, "seller should still be paid despite the reverting attestation");
     }
 
     /// The kill switch also gates the attestation calls, not just createJob's gate — with
@@ -756,7 +749,7 @@ contract JobEscrowTest is Test {
 
         vm.prank(buyer);
         jobEscrow.release(jobId);
-        assertEq(usdc.balanceOf(seller), AMOUNT, "release should still succeed under the job's original window");
+        assertEq(seller.balance, AMOUNT, "release should still succeed under the job's original window");
     }
 
     /// The mirror image: claimTimeout must NOT be claimable yet at that same point in time,
@@ -782,27 +775,26 @@ contract JobEscrowTest is Test {
         uint64 tooFar = maxDeadline + 1;
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(JobEscrow.DeadlineTooFar.selector, tooFar, maxDeadline));
-        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, tooFar, bytes32(0));
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, tooFar, bytes32(0));
     }
 
     /// A deadline exactly at the boundary must still succeed — the cap shouldn't be off-by-one.
     function test_CreateJobAllowsDeadlineAtMax() public {
         uint64 maxDeadline = uint64(block.timestamp) + jobEscrow.MAX_JOB_DURATION();
         vm.prank(buyer);
-        uint256 jobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, maxDeadline, bytes32(0));
+        uint256 jobId = jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, maxDeadline, bytes32(0));
         assertEq(jobId, 0, "boundary deadline should be accepted");
     }
 
     /// The specific overflow this bound exists to prevent: without it, a "no real deadline"
-    /// sentinel like type(uint64).max — the same convention this codebase's own tests use
-    /// for USDC allowances (`approve(..., type(uint256).max)`) — would make
-    /// completionDeadline + responseWindow overflow uint64 and permanently lock the job's
-    /// escrow and reserved bond, since every exit path computes that same sum.
+    /// sentinel like type(uint64).max would make completionDeadline + responseWindow
+    /// overflow uint64 and permanently lock the job's escrow and reserved bond, since every
+    /// exit path computes that same sum.
     function test_RevertWhen_CreateJobDeadlineIsMaxUint64Sentinel() public {
         uint64 maxDeadline = uint64(block.timestamp) + jobEscrow.MAX_JOB_DURATION();
         vm.prank(buyer);
         vm.expectRevert(abi.encodeWithSelector(JobEscrow.DeadlineTooFar.selector, type(uint64).max, maxDeadline));
-        jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, type(uint64).max, bytes32(0));
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, type(uint64).max, bytes32(0));
     }
 
     // ------------------------------------------------------------------ zero-bond-ratio configuration
@@ -814,7 +806,7 @@ contract JobEscrowTest is Test {
         jobEscrow.setMinBondRatioBps(0);
 
         vm.prank(buyer);
-        uint256 jobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
+        uint256 jobId = jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
 
         (,,,, uint256 reservedBond,,,,,) = jobEscrow.jobs(jobId);
         assertEq(reservedBond, 0, "reservedBond should be zero at 0% ratio");
@@ -822,7 +814,7 @@ contract JobEscrowTest is Test {
 
         vm.prank(buyer);
         jobEscrow.release(jobId);
-        assertEq(usdc.balanceOf(seller), AMOUNT, "seller should still be paid in full");
+        assertEq(seller.balance, AMOUNT, "seller should still be paid in full");
     }
 
     /// The seller-at-fault dispute path also has nothing to slash at 0% ratio — the buyer
@@ -831,13 +823,14 @@ contract JobEscrowTest is Test {
         jobEscrow.setMinBondRatioBps(0);
 
         vm.prank(buyer);
-        uint256 jobId = jobEscrow.createJob(SELLER_AGENT_ID, AMOUNT, completionDeadline, bytes32(0));
+        uint256 jobId = jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
         vm.prank(buyer);
         jobEscrow.dispute(jobId, EVIDENCE_HASH);
 
+        uint256 buyerBalanceBefore = buyer.balance;
         vm.prank(arbiter);
         jobEscrow.resolveDispute(jobId, true);
 
-        assertEq(usdc.balanceOf(buyer), AMOUNT, "buyer should get the escrow refund with no bond to slash");
+        assertEq(buyer.balance, buyerBalanceBefore + AMOUNT, "buyer should get the escrow refund with no bond to slash");
     }
 }
