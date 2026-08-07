@@ -18,8 +18,10 @@
 
 import { createClient } from "@supabase/supabase-js";
 import { NextRequest, NextResponse } from "next/server";
-import { zeroHash } from "viem";
+import { randomUUID } from "node:crypto";
+import { keccak256, toBytes } from "viem";
 import { getJob, JobStatus, recoverJobIdSigner } from "./jobEscrow";
+import { registerValidationRequest } from "./validationRegistry";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -44,6 +46,18 @@ const JOB_ESCROW_ADDRESS = rawJobEscrowAddress as `0x${string}` | undefined;
 /** Parses a "$0.001"-style price string into USDC atomic units (6 decimals). */
 function priceToAtomicUnits(price: string): bigint {
   return BigInt(Math.round(parseFloat(price.replace("$", "")) * 1_000_000));
+}
+
+/**
+ * A fresh, globally-unique requestHash for one 402 response. The randomUUID is what
+ * actually guarantees uniqueness — required both by the real registry (a second
+ * validationRequest for an already-used hash reverts) and by JobEscrow's own
+ * one-hash-one-job rule. The sellerAgentId/endpoint prefix carries no security meaning
+ * (endpoint-binding is deliberately not enforced yet); it's purely so this hash reads as
+ * something in logs instead of opaque bytes.
+ */
+function generateRequestHash(endpoint: string): `0x${string}` {
+  return keccak256(toBytes(`${SELLER_AGENT_ID}-${endpoint}-${randomUUID()}`));
 }
 
 /**
@@ -78,18 +92,32 @@ export function withGateway(
 
     const jobIdHeader = req.headers.get("x-job-id");
 
-    // No jobId yet — buyer hasn't created a job. Tell them what to create one against.
+    // No jobId yet — buyer hasn't created a job. Register a real validation request
+    // naming JobEscrow as validator, then tell them what to create one against.
     if (!jobIdHeader) {
       console.log(`[escrow] 402 Job Required: ${endpoint}`);
+
+      const requestHash = generateRequestHash(endpoint);
+      try {
+        await registerValidationRequest({
+          validatorAddress: JOB_ESCROW_ADDRESS,
+          agentId: SELLER_AGENT_ID,
+          requestURI: endpoint,
+          requestHash,
+        });
+      } catch (err) {
+        console.error(
+          `Failed to register validation request for ${endpoint}:`,
+          err instanceof Error ? err.message : err,
+        );
+        return NextResponse.json({ error: "Failed to register validation request" }, { status: 500 });
+      }
+
       return NextResponse.json(
         {
           price,
           sellerAgentId: SELLER_AGENT_ID.toString(),
-          // TODO(Phase 3): real ERC-8004 validationRequest() hash, once the Validation
-          // Registry is wired in on both sides. JobEscrow.createJob() doesn't check
-          // this field yet either, so a fake-but-real-looking hash here would just be
-          // misleading — a zero placeholder is the honest thing to send.
-          requestHash: zeroHash,
+          requestHash,
           jobEscrowAddress: JOB_ESCROW_ADDRESS,
         },
         { status: 402 },
@@ -145,13 +173,15 @@ export function withGateway(
     if (job.sellerAgentId !== SELLER_AGENT_ID) {
       return NextResponse.json({ error: `Job ${jobId} was not created for this seller` }, { status: 400 });
     }
-    // Known limitation: this only checks seller + amount, not which endpoint the job
-    // was quoted for. Today the four routes happen to have distinct prices, so this
-    // can't be exploited by accident, but nothing stops a job created against one
-    // endpoint's price from being replayed against a different endpoint charging the
-    // same amount. Binding a job to a specific endpoint is exactly what Phase 3's
-    // requestHash check (once real) is meant to close — not fixed here on purpose,
-    // since the contract side doesn't enforce it yet either.
+    // Known limitation, deliberately deferred (see plans/08-disclosures.md): this only
+    // checks seller + amount, not which endpoint the job was quoted for. Today the four
+    // routes happen to have distinct prices, so this can't be exploited by accident, but
+    // nothing stops a job created against one endpoint's price from being replayed
+    // against a different endpoint charging the same amount. requestHash is real now
+    // (see generateRequestHash/registerValidationRequest above) but deliberately isn't
+    // endpoint-bound — closing that gap means encoding endpoint identity into the
+    // registry's requestURI and checking it back here, decided against for now given
+    // the timeline.
     if (job.amount !== expectedAmount) {
       return NextResponse.json(
         { error: `Job ${jobId} amount (${job.amount}) does not match the quoted price (${expectedAmount})` },
