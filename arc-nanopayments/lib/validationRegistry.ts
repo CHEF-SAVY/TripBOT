@@ -1,6 +1,7 @@
 import { createPublicClient, createWalletClient, http } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { arcTestnet } from "viem/chains";
+import { nonceManager } from "viem/nonce";
 
 const ARC_TESTNET_RPC = "https://rpc.testnet.arc.network";
 
@@ -37,7 +38,13 @@ const VALIDATION_REGISTRY_ABI = [
 if (!process.env.SELLER_PRIVATE_KEY) {
   throw new Error("SELLER_PRIVATE_KEY not configured");
 }
-const sellerAccount = privateKeyToAccount(process.env.SELLER_PRIVATE_KEY as `0x${string}`);
+// nonceManager serializes nonce assignment across concurrent calls from this one
+// account. Without it, two overlapping requests to a protected route (this is a
+// Next.js API route, so concurrent requests are real, not hypothetical) could both
+// read the same pending nonce and race: the loser either gets rejected outright or
+// silently replaces the winner's transaction in the mempool, leaving
+// waitForTransactionReceipt below waiting on a hash that will never mine.
+const sellerAccount = privateKeyToAccount(process.env.SELLER_PRIVATE_KEY as `0x${string}`, { nonceManager });
 
 const publicClient = createPublicClient({
   chain: arcTestnet,
