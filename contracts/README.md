@@ -95,8 +95,38 @@ paymaster that rejects the zero-gas-price tx) both submit normally and land on-c
 zero-gas-price signing/submission path itself was exercised against a local mock relay —
 real end-to-end sponsorship needs an actual sponsor account, which this project doesn't have.
 
-## Blob API (not yet wired)
+## Blob API
 
-`eth_getBlobSidecars` / `eth_getBlobSidecarByTxHash` — a cheaper place than contract storage
-to anchor dispute evidence alongside the on-chain `evidenceHash`. Nice-to-have, not required
-for the core escrow lifecycle.
+`script/evidence-submit.sh` anchors a buyer's dispute evidence in an EIP-4844 blob instead of
+only a hash in contract storage — cheaper than calldata/storage for the same bytes, and
+retrievable later by anyone via BOT Chain's Blob API:
+
+```bash
+./script/evidence-submit.sh evidence.json --private-key $BUYER_PRIVATE_KEY
+# TX_HASH=0x...
+# EVIDENCE_HASH=0x...   (the blob's own KZG-committed versioned hash)
+```
+
+The printed `EVIDENCE_HASH` is passed directly as `dispute(jobId, evidenceHash)`'s argument —
+so the on-chain record is a real cryptographic commitment to the blob's contents, not an
+independent hash alongside an unrelated pointer. To retrieve the evidence later given the
+blob tx hash:
+
+```bash
+./script/evidence-fetch.sh 0xTX_HASH evidence-recovered.json
+```
+
+Blobs are packed as 4096 32-byte BLS12-381 field elements; `evidence-fetch.sh` decodes the
+same "8-byte length prefix + 31-usable-bytes-per-field-element" framing `cast send --blob`
+uses to pack data in — reverse-engineered and confirmed byte-for-byte against `bot_testnet`
+(BOT Chain's docs specify the RPC methods but not an application-level blob content format).
+
+Verified end to end on `bot_testnet`: submitted real evidence in a blob, fetched it back via
+`eth_getBlobSidecarByTxHash`, confirmed the decoded bytes are identical to the original file,
+then disputed and resolved a real job using the blob's versioned hash as `evidenceHash`
+throughout. One honest finding from that run: the dispute payout and bond slash succeeded,
+but the Validation Registry attestation call inside `resolveDispute` ran out of gas (an
+artifact of automatic gas estimation under-costing the `try/catch`, not a blob or contract
+issue) and was silently caught — a live demonstration, not just a unit test, of the exact
+invariant `_attestValidation`'s `try/catch` exists to guarantee: an attestation failure never
+blocks a payout that's otherwise ready.
