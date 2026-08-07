@@ -8,15 +8,20 @@ import { createJob, releaseJob, disputeJob, signJobId } from "./lib/jobEscrow.ts
 // (CLAUDE.md): plain `npm run agent` drives the clean release; `-- --dispute` drives
 // the disputed-slash run using the same real delivery, just forcing the buyer's
 // verdict to "bad" rather than faking the seller's response.
+// expectedPrice is this buyer's own known-good reference for each endpoint (mirrors the
+// price each route.ts hardcodes on the seller side) — see the 402-response verification
+// below for why this matters: without it, the buyer has no independent check on what a
+// seller's 402 response claims.
 const ENDPOINTS = {
-  quote: { path: "/api/premium/quote", method: "GET" as const },
-  dataset: { path: "/api/premium/dataset", method: "GET" as const },
+  quote: { path: "/api/premium/quote", method: "GET" as const, expectedPrice: "$0.001" },
+  dataset: { path: "/api/premium/dataset", method: "GET" as const, expectedPrice: "$0.01" },
   compute: {
     path: "/api/premium/compute",
     method: "POST" as const,
     body: { text: "Hello from the Tripwire escrow demo!" },
+    expectedPrice: "$0.0003",
   },
-  "agent-task": { path: "/api/premium/agent-task", method: "GET" as const },
+  "agent-task": { path: "/api/premium/agent-task", method: "GET" as const, expectedPrice: "$0.03" },
 };
 type EndpointName = keyof typeof ENDPOINTS;
 
@@ -58,6 +63,19 @@ if (!buyerKey) {
   process.exit(1);
 }
 
+// The buyer's own trusted source for which JobEscrow contract is real — never the
+// seller's word for it. Without this, a malicious or compromised seller server could
+// return a fake jobEscrowAddress in its 402 response; the approve() call below would
+// then grant that address permission to pull the buyer's USDC directly via
+// transferFrom, before createJob is ever even attempted — the classic
+// approve-to-scam-contract pattern. Same env file the seller already trusts
+// (--env-file=.env.local, see package.json), so this costs nothing new to configure.
+const trustedJobEscrowAddress = process.env.JOB_ESCROW_ADDRESS as `0x${string}` | undefined;
+if (!trustedJobEscrowAddress) {
+  console.error("Missing JOB_ESCROW_ADDRESS. Set it in .env.local once Phase 4 deploys.");
+  process.exit(1);
+}
+
 const account = privateKeyToAccount(buyerKey);
 const publicClient = createPublicClient({ chain: arcTestnet, transport: http(ARC_TESTNET_RPC) });
 const walletClient = createWalletClient({ account, chain: arcTestnet, transport: http(ARC_TESTNET_RPC) });
@@ -86,6 +104,25 @@ const quote = (await quoteRes.json()) as {
 };
 console.log(`402 received: ${quote.price} USDC, sellerAgentId ${quote.sellerAgentId}, JobEscrow ${quote.jobEscrowAddress}`);
 
+// Verify against our own known-good values before spending anything — never trust the
+// seller's response alone. Both checks run before the approve() below, since that's the
+// step that actually grants spending rights.
+if (quote.jobEscrowAddress.toLowerCase() !== trustedJobEscrowAddress.toLowerCase()) {
+  console.error(
+    `Refusing to proceed: seller quoted jobEscrowAddress ${quote.jobEscrowAddress}, but this buyer's ` +
+      `trusted address (JOB_ESCROW_ADDRESS) is ${trustedJobEscrowAddress}. This could be a malicious or ` +
+      `misconfigured seller — approving against an unverified address risks losing funds to it directly.`,
+  );
+  process.exit(1);
+}
+if (quote.price !== target.expectedPrice) {
+  console.error(
+    `Refusing to proceed: seller quoted ${quote.price} for ${target.path}, but this buyer expects ` +
+      `${target.expectedPrice}. Refusing to approve an unexpected amount.`,
+  );
+  process.exit(1);
+}
+
 const amount = parseUnits(quote.price.replace("$", ""), 6);
 
 // --- 2. Approve JobEscrow to pull the payment ---
@@ -94,14 +131,14 @@ const approveTxHash = await walletClient.writeContract({
   address: ARC_TESTNET_USDC,
   abi: erc20Abi,
   functionName: "approve",
-  args: [quote.jobEscrowAddress, amount],
+  args: [trustedJobEscrowAddress, amount],
 });
 await publicClient.waitForTransactionReceipt({ hash: approveTxHash });
 
 // --- 3. Create the escrowed job ---
 console.log("Creating job...");
 const completionDeadline = BigInt(Math.floor(Date.now() / 1000)) + JOB_DURATION_SECONDS;
-const { jobId, txHash: createTxHash } = await createJob(walletClient, quote.jobEscrowAddress, {
+const { jobId, txHash: createTxHash } = await createJob(walletClient, trustedJobEscrowAddress, {
   sellerAgentId: BigInt(quote.sellerAgentId),
   amount,
   completionDeadline,
@@ -147,11 +184,11 @@ console.log(`Verdict: ${isGood ? "GOOD" : "BAD"}`);
 // --- 6. Release or dispute ---
 if (isGood) {
   console.log("Releasing payment...");
-  const releaseTxHash = await releaseJob(walletClient, quote.jobEscrowAddress, jobId);
+  const releaseTxHash = await releaseJob(walletClient, trustedJobEscrowAddress, jobId);
   console.log(`Released (tx ${releaseTxHash}). Seller paid in full, bond reservation freed.`);
 } else {
   const evidenceHash = keccak256(toBytes(deliveryText || "no-content-delivered"));
   console.log(`Disputing with evidenceHash ${evidenceHash}...`);
-  const disputeTxHash = await disputeJob(walletClient, quote.jobEscrowAddress, jobId, evidenceHash);
+  const disputeTxHash = await disputeJob(walletClient, trustedJobEscrowAddress, jobId, evidenceHash);
   console.log(`Disputed (tx ${disputeTxHash}). Awaiting arbiter resolution via resolveDispute().`);
 }
