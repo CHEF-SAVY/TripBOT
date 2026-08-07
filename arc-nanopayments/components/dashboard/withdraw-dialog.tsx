@@ -100,7 +100,12 @@ export function WithdrawDialog({ maxAvailable, onWithdraw }: WithdrawDialogProps
     try {
       const res = await fetch("/api/gateway/withdraw", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          // Shared-secret check, not real per-user auth — see the route's own comment
+          // for why that's an acceptable MVP tradeoff for this single-operator app.
+          Authorization: `Bearer ${process.env.NEXT_PUBLIC_WITHDRAW_API_KEY ?? ""}`,
+        },
         body: JSON.stringify({
           amount,
           destinationChain: chain,

@@ -40,6 +40,26 @@ const supabase = createClient(
 );
 
 export async function POST(req: NextRequest) {
+  // This route moves real funds out of the seller's Gateway balance to a
+  // destinationAddress the caller supplies. It previously had no authentication at
+  // all — reachable by anyone who could reach this server, not just the dashboard.
+  // A shared secret is the pragmatic MVP-level fix (this app has no concept of
+  // separate users, it's a single-operator tool): closes the "any automated
+  // scanner or opportunistic caller can just POST here" gap. It is not a substitute
+  // for real per-user authentication in a multi-tenant deployment — disclosed as
+  // such, same honesty standard as the single-arbiter disclosure elsewhere.
+  const expectedApiKey = process.env.WITHDRAW_API_KEY;
+  if (!expectedApiKey) {
+    return NextResponse.json(
+      { error: "WITHDRAW_API_KEY not configured" },
+      { status: 500 },
+    );
+  }
+  const providedApiKey = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  if (providedApiKey !== expectedApiKey) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const privateKey = process.env.SELLER_PRIVATE_KEY;
   if (!privateKey) {
     return NextResponse.json(
