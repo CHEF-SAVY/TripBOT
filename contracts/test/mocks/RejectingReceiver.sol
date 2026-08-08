@@ -9,5 +9,4 @@ pragma solidity ^0.8.24;
 contract RejectingReceiver {
     // Deliberately no receive() or fallback() — any plain value transfer to this contract
     // fails at the EVM level.
-
-    }
+}
