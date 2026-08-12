@@ -22,7 +22,7 @@ contract Deploy is Script {
         vm.startBroadcast(deployerKey);
 
         IdentityRegistry identityRegistry = new IdentityRegistry();
-        ValidationRegistry validationRegistry = new ValidationRegistry();
+        ValidationRegistry validationRegistry = new ValidationRegistry(address(identityRegistry));
 
         // Deployer becomes owner (set automatically to msg.sender in both constructors)
         // and, separately, is passed here as the immutable ARBITER — a deliberate choice
