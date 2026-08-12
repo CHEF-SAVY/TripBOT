@@ -6,3 +6,16 @@
 *.md
 !README.md
 plans/
+
+# motion/design reference clips — third-party, local only
+ui_ux_designtemp/
+
+# Next.js application
+web/node_modules/
+web/.next/
+web/out/
+web/.env
+web/.env.local
+web/.env.*.local
+web/*.tsbuildinfo
+web/coverage/
