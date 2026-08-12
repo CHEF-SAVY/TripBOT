@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isHex, type Hex } from "viem";
 import { z } from "zod";
+import { bot } from "@/lib/chain";
 import { adjudicateDelivery } from "@/lib/delivery";
+import { getJob, readBond } from "@/lib/jobs";
 import { requireJudgeAccess, requireSameOrigin } from "@/lib/security/request";
 import { assertDemoWriteReady } from "@/lib/security/readiness";
 import { hashBinding, verifySessionToken } from "@/lib/security/tokens";
@@ -62,9 +64,21 @@ export async function POST(request: NextRequest) {
 
     const neutral = evidence.infrastructureFailure;
     const sellerAtFault = neutral ? null : adjudicateDelivery(evidence.sellerKey, evidence.delivery);
+
+    // Snapshotted around the ruling so the interface can show the buyer's compensation as
+    // two separate movements. The escrow refund and the slashed bond come from different
+    // contracts, and that separation is the whole argument the product makes — a single
+    // net figure would hide it.
+    const before = await getJob(BigInt(claims.jobId));
+    const bondBefore = await readBond(before.sellerAgentId);
+
     const resolution = neutral
       ? await resolveNeutralDispute(BigInt(claims.jobId), session.evidence_hash as Hex)
       : await resolveStoredDispute(BigInt(claims.jobId), sellerAtFault as boolean, session.evidence_hash as Hex);
+
+    const bondAfter = await readBond(before.sellerAgentId);
+    const slashed = sellerAtFault === true ? before.reservedBond : 0n;
+    const refunded = sellerAtFault === false ? 0n : before.amount;
     await updateSession(session.id, {
       state: "resolved",
       resolved_at: new Date().toISOString(),
@@ -79,6 +93,14 @@ export async function POST(request: NextRequest) {
           : "Evidence did not prove seller fault: escrow paid the seller and released the bond.",
       txHash: resolution.txHash,
       outcome: neutral ? "neutral" : sellerAtFault ? "seller-at-fault" : "seller-prevails",
+      payments: {
+        refundBot: bot(refunded),
+        slashedBondBot: bot(slashed),
+        totalBot: bot(refunded + slashed),
+        bondBeforeBot: bondBefore.display.gross,
+        bondAfterBot: bondAfter.display.gross,
+        paidTo: sellerAtFault === false ? "seller" : "buyer",
+      },
     });
   } catch (error) {
     console.error("Dispute resolution rejected", error);
