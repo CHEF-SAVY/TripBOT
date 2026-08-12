@@ -86,15 +86,22 @@ export async function readProofs(): Promise<{ proofs: Map<string, JobProofs>; re
     ["JobTimedOut", "timeout"],
     ["JobDisputeTimedOut", "timeout"],
   ] as const;
-  for (const [eventName, proofKey] of events) {
-    const logs = await publicClient.getContractEvents({
-      address,
-      abi: jobEscrowAbi,
-      eventName,
-      fromBlock: BOT_TESTNET_DEPLOYMENT.deploymentBlock,
-      toBlock: "latest",
-    });
-    for (const log of logs) {
+  // Fanned out rather than awaited in sequence: these are seven independent range scans
+  // over the same block window, and run serially they dominate the latency of the job
+  // ledger — the slowest read surface in the app.
+  const scans = await Promise.all(
+    events.map(([eventName]) =>
+      publicClient.getContractEvents({
+        address,
+        abi: jobEscrowAbi,
+        eventName,
+        fromBlock: BOT_TESTNET_DEPLOYMENT.deploymentBlock,
+        toBlock: "latest",
+      }),
+    ),
+  );
+  for (const [index, [eventName, proofKey]] of events.entries()) {
+    for (const log of scans[index]) {
       const args = log.args as { jobId?: bigint; sellerAtFault?: boolean };
       if (args.jobId === undefined) continue;
       const id = args.jobId.toString();
