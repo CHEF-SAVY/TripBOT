@@ -3,10 +3,12 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {ValidationRegistry} from "../src/registries/ValidationRegistry.sol";
+import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
 
 /// @title ValidationRegistryTest — unit tests for the minimal ERC-8004 Validation Registry stand-in
 contract ValidationRegistryTest is Test {
     ValidationRegistry internal registry;
+    MockIdentityRegistry internal identityRegistry;
 
     address internal seller = makeAddr("seller");
     address internal validator = makeAddr("validator");
@@ -14,7 +16,9 @@ contract ValidationRegistryTest is Test {
     uint256 internal constant AGENT_ID = 851_889;
 
     function setUp() public {
-        registry = new ValidationRegistry();
+        identityRegistry = new MockIdentityRegistry();
+        identityRegistry.setAgentOwner(AGENT_ID, seller);
+        registry = new ValidationRegistry(address(identityRegistry));
     }
 
     function test_ValidationRequestThenResponseRoundTrips() public {
@@ -64,5 +68,19 @@ contract ValidationRegistryTest is Test {
         vm.stopPrank();
 
         assertTrue(first != second, "identical requests should still get distinct hashes");
+    }
+
+    function test_RevertWhen_ValidationRequestCallerDoesNotControlAgent() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(ValidationRegistry.NotAgentOwnerOrOperator.selector, AGENT_ID, stranger));
+        registry.validationRequest(validator, AGENT_ID, "ipfs://job-details");
+    }
+
+    function test_RevertWhen_ResponseExceedsStandardRange() public {
+        vm.prank(seller);
+        bytes32 requestHash = registry.validationRequest(validator, AGENT_ID, "");
+        vm.prank(validator);
+        vm.expectRevert(abi.encodeWithSelector(ValidationRegistry.ResponseOutOfRange.selector, 101));
+        registry.validationResponse(requestHash, 101, "", bytes32(0), "INVALID");
     }
 }

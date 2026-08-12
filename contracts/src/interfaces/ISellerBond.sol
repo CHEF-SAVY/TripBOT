@@ -5,6 +5,10 @@ pragma solidity ^0.8.24;
 /// contract's signatures exactly (contracts/src/SellerBond.sol) — this is our own contract,
 /// so unlike IIdentityRegistry there's no external ABI to verify against.
 interface ISellerBond {
+    function JOB_ESCROW() external view returns (address);
+
+    function IDENTITY_REGISTRY() external view returns (address);
+
     /// @notice Lock `amount` of the agent's free bond for a job. Reverts if insufficient.
     function reserve(uint256 agentId, uint256 amount) external;
 

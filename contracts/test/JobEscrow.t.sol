@@ -6,6 +6,7 @@ import {JobEscrow} from "../src/JobEscrow.sol";
 import {SellerBond} from "../src/SellerBond.sol";
 import {MockIdentityRegistry} from "./mocks/MockIdentityRegistry.sol";
 import {MockValidationRegistry} from "./mocks/MockValidationRegistry.sol";
+import {RejectingReceiver} from "./mocks/RejectingReceiver.sol";
 
 /// @title JobEscrowTest — unit tests for JobEscrow against mocked externals + a real SellerBond
 /// @notice SellerBond is real (not mocked) here on purpose: createJob's insufficient-bond
@@ -89,6 +90,23 @@ contract JobEscrowTest is Test {
         completionDeadline = uint64(block.timestamp) + 1 days;
     }
 
+    // ------------------------------------------------------------------ constructor
+
+    function test_RevertWhen_ConstructorArbiterIsZero() public {
+        vm.expectRevert(JobEscrow.InvalidAddress.selector);
+        new JobEscrow(address(registry), address(validationRegistry), address(0));
+    }
+
+    function test_RevertWhen_ConstructorIdentityRegistryHasNoCode() public {
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.InvalidContract.selector, stranger));
+        new JobEscrow(stranger, address(validationRegistry), arbiter);
+    }
+
+    function test_RevertWhen_ConstructorValidationRegistryHasNoCode() public {
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.InvalidContract.selector, stranger));
+        new JobEscrow(address(registry), stranger, arbiter);
+    }
+
     // ------------------------------------------------------------------ setSellerBond
 
     function test_SetSellerBondWiresAddressAndEmits() public {
@@ -114,6 +132,15 @@ contract JobEscrowTest is Test {
     function test_RevertWhen_SetSellerBondCalledTwice() public {
         vm.expectRevert(JobEscrow.SellerBondAlreadySet.selector);
         jobEscrow.setSellerBond(makeAddr("anotherSellerBond"));
+    }
+
+    function test_RevertWhen_SetSellerBondHasDifferentEscrowWiring() public {
+        JobEscrow fresh = new JobEscrow(address(registry), address(validationRegistry), arbiter);
+        JobEscrow otherEscrow = new JobEscrow(address(registry), address(validationRegistry), arbiter);
+        SellerBond wrongBond = new SellerBond(address(registry), address(otherEscrow));
+
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.SellerBondMisconfigured.selector, address(wrongBond)));
+        fresh.setSellerBond(address(wrongBond));
     }
 
     // ------------------------------------------------------------------ createJob
@@ -401,6 +428,14 @@ contract JobEscrowTest is Test {
         jobEscrow.dispute(jobId, EVIDENCE_HASH);
     }
 
+    function test_RevertWhen_DisputeEvidenceHashIsZero() public {
+        uint256 jobId = _createJob();
+
+        vm.prank(buyer);
+        vm.expectRevert(JobEscrow.EvidenceHashRequired.selector);
+        jobEscrow.dispute(jobId, bytes32(0));
+    }
+
     // ------------------------------------------------------------------ resolveDispute
 
     function _createAndDisputeJob() internal returns (uint256 jobId) {
@@ -447,6 +482,29 @@ contract JobEscrowTest is Test {
         assertEq(sellerBond.bondOf(SELLER_AGENT_ID), SELLER_STAKE, "seller's full stake should be free again");
     }
 
+    function test_ResolveDisputeNeutralRefundsBuyerWithoutSlashingSeller() public {
+        uint256 jobId = _createAndDisputeJob();
+        uint256 buyerBalanceBefore = buyer.balance;
+        uint256 grossBondBefore = sellerBond.bondBalance(SELLER_AGENT_ID);
+
+        vm.prank(arbiter);
+        jobEscrow.resolveDisputeNeutral(jobId);
+
+        assertEq(buyer.balance, buyerBalanceBefore + AMOUNT, "neutral outcome should refund escrow");
+        assertEq(seller.balance, 0, "neutral outcome must not pay for missing work");
+        assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "neutral outcome should release collateral");
+        assertEq(sellerBond.bondBalance(SELLER_AGENT_ID), grossBondBefore, "neutral outcome must not slash");
+        (,,,,,,, JobEscrow.JobStatus status,,) = jobEscrow.jobs(jobId);
+        assertEq(uint8(status), uint8(JobEscrow.JobStatus.Resolved), "neutral outcome should settle the dispute");
+    }
+
+    function test_RevertWhen_ResolveNeutralByNonArbiter() public {
+        uint256 jobId = _createAndDisputeJob();
+        vm.prank(stranger);
+        vm.expectRevert(JobEscrow.NotArbiter.selector);
+        jobEscrow.resolveDisputeNeutral(jobId);
+    }
+
     function test_RevertWhen_ResolveDisputeByNonArbiter() public {
         uint256 jobId = _createAndDisputeJob();
         vm.prank(stranger);
@@ -460,6 +518,50 @@ contract JobEscrowTest is Test {
         vm.prank(arbiter);
         vm.expectRevert(abi.encodeWithSelector(JobEscrow.JobNotDisputed.selector, jobId, JobEscrow.JobStatus.Active));
         jobEscrow.resolveDispute(jobId, true);
+    }
+
+    // ---------------------------------------------------------- claimDisputeTimeout
+
+    function test_RevertWhen_ClaimDisputeTimeoutBeforeDeadline() public {
+        uint256 jobId = _createAndDisputeJob();
+        uint64 deadline = jobEscrow.disputeDeadline(jobId);
+
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.ArbitrationWindowNotElapsed.selector, jobId, deadline));
+        jobEscrow.claimDisputeTimeout(jobId);
+    }
+
+    function test_ClaimDisputeTimeoutRefundsWithoutUnprovenSlash() public {
+        uint256 jobId = _createAndDisputeJob();
+        uint256 buyerBalanceBefore = buyer.balance;
+        uint256 sellerGrossBondBefore = sellerBond.bondBalance(SELLER_AGENT_ID);
+
+        vm.warp(jobEscrow.disputeDeadline(jobId));
+        vm.prank(stranger);
+        jobEscrow.claimDisputeTimeout(jobId);
+
+        assertEq(buyer.balance, buyerBalanceBefore + AMOUNT, "buyer should recover escrow");
+        assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "unadjudicated collateral should be released");
+        assertEq(
+            sellerBond.bondBalance(SELLER_AGENT_ID), sellerGrossBondBefore, "timeout must not slash without a ruling"
+        );
+        (,,,,,,, JobEscrow.JobStatus status,,) = jobEscrow.jobs(jobId);
+        assertEq(uint8(status), uint8(JobEscrow.JobStatus.Resolved), "timeout should settle the dispute");
+    }
+
+    function test_DisputeDeadlineIsUnaffectedByLaterWindowChange() public {
+        jobEscrow.setArbitrationWindow(2 days);
+        uint256 jobId = _createAndDisputeJob();
+        uint64 snapshottedDeadline = jobEscrow.disputeDeadline(jobId);
+
+        jobEscrow.setArbitrationWindow(1 hours);
+        vm.warp(snapshottedDeadline - 1);
+        vm.expectRevert(
+            abi.encodeWithSelector(JobEscrow.ArbitrationWindowNotElapsed.selector, jobId, snapshottedDeadline)
+        );
+        jobEscrow.claimDisputeTimeout(jobId);
+
+        vm.warp(snapshottedDeadline);
+        jobEscrow.claimDisputeTimeout(jobId);
     }
 
     // ------------------------------------------------------------------ claimTimeout
@@ -815,6 +917,119 @@ contract JobEscrowTest is Test {
         vm.prank(buyer);
         jobEscrow.release(jobId);
         assertEq(seller.balance, AMOUNT, "seller should still be paid in full");
+    }
+
+    function test_TinyNonzeroJobRoundsRequiredBondUp() public {
+        vm.prank(buyer);
+        uint256 jobId = jobEscrow.createJob{value: 1}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
+
+        (,,,, uint256 reservedBond,,,,,) = jobEscrow.jobs(jobId);
+        assertEq(reservedBond, 1, "a nonzero collateral ratio must not round down to zero");
+        assertEq(sellerBond.reserved(SELLER_AGENT_ID), 1, "the rounded collateral must actually be reserved");
+    }
+
+    function test_RejectedSellerPayoutDoesNotBlockRelease() public {
+        RejectingReceiver rejecting = new RejectingReceiver();
+        registry.setAgentOwner(SELLER_AGENT_ID, address(rejecting));
+
+        uint256 jobId = _createJob();
+        vm.prank(buyer);
+        jobEscrow.release(jobId);
+
+        assertEq(jobEscrow.pendingPayouts(address(rejecting)), AMOUNT, "failed push should become a pull credit");
+        assertEq(sellerBond.reserved(SELLER_AGENT_ID), 0, "bond must be released despite payout incompatibility");
+        (,,,,,,, JobEscrow.JobStatus status,,) = jobEscrow.jobs(jobId);
+        assertEq(uint8(status), uint8(JobEscrow.JobStatus.Released), "release should settle atomically");
+    }
+
+    function test_PauseBlocksOnlyNewJobs() public {
+        uint256 existingJobId = _createJob();
+        jobEscrow.setJobCreationPaused(true);
+
+        vm.prank(buyer);
+        vm.expectRevert(JobEscrow.JobCreationIsPaused.selector);
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, bytes32(0));
+
+        vm.prank(buyer);
+        jobEscrow.release(existingJobId);
+        assertEq(seller.balance, AMOUNT, "the emergency brake must leave existing exits live");
+    }
+
+    function test_DisabledValidationRejectsAmbiguousNonzeroHash() public {
+        bytes32 requestHash = keccak256("must-not-be-recorded");
+        vm.prank(buyer);
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.ValidationHashMustBeZeroWhenDisabled.selector, requestHash));
+        jobEscrow.createJob{value: AMOUNT}(SELLER_AGENT_ID, completionDeadline, requestHash);
+    }
+
+    function test_ArbiterRotationRequiresAcceptance() public {
+        address newArbiter = makeAddr("newArbiter");
+        jobEscrow.transferArbiter(newArbiter);
+
+        assertEq(jobEscrow.ARBITER(), arbiter, "proposal alone must not rotate authority");
+        vm.prank(stranger);
+        vm.expectRevert(JobEscrow.NotPendingArbiter.selector);
+        jobEscrow.acceptArbiter();
+
+        vm.prank(newArbiter);
+        jobEscrow.acceptArbiter();
+        assertEq(jobEscrow.ARBITER(), newArbiter, "pending arbiter should take authority on acceptance");
+    }
+
+    function test_OwnershipRotationRequiresAcceptance() public {
+        address newOwner = makeAddr("newOwner");
+        jobEscrow.transferOwnership(newOwner);
+        assertEq(jobEscrow.owner(), address(this), "proposal alone must not rotate authority");
+
+        vm.prank(stranger);
+        vm.expectRevert(JobEscrow.NotPendingOwner.selector);
+        jobEscrow.acceptOwnership();
+
+        vm.prank(newOwner);
+        jobEscrow.acceptOwnership();
+        assertEq(jobEscrow.owner(), newOwner, "pending owner should take authority on acceptance");
+    }
+
+    function test_RevertWhen_ArbitrationWindowExceedsMaximum() public {
+        uint64 tooLong = jobEscrow.MAX_ARBITRATION_WINDOW() + 1;
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                JobEscrow.ArbitrationWindowTooLong.selector, tooLong, jobEscrow.MAX_ARBITRATION_WINDOW()
+            )
+        );
+        jobEscrow.setArbitrationWindow(tooLong);
+    }
+
+    function test_RevertWhen_AdministrativeAddressesAreZero() public {
+        vm.expectRevert(JobEscrow.InvalidAddress.selector);
+        jobEscrow.transferOwnership(address(0));
+        vm.expectRevert(JobEscrow.InvalidAddress.selector);
+        jobEscrow.transferArbiter(address(0));
+    }
+
+    function test_DeferredPayoutCanBePulledAfterReceiverBecomesCompatible() public {
+        RejectingReceiver rejecting = new RejectingReceiver();
+        registry.setAgentOwner(SELLER_AGENT_ID, address(rejecting));
+        uint256 jobId = _createJob();
+        vm.prank(buyer);
+        jobEscrow.release(jobId);
+
+        vm.prank(address(rejecting));
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.NativeTransferFailed.selector, address(rejecting), AMOUNT));
+        jobEscrow.withdrawPayout();
+        assertEq(jobEscrow.pendingPayouts(address(rejecting)), AMOUNT, "failed pull must retain the credit");
+
+        vm.etch(address(rejecting), hex"");
+        vm.prank(address(rejecting));
+        jobEscrow.withdrawPayout();
+        assertEq(jobEscrow.pendingPayouts(address(rejecting)), 0, "successful pull should consume the credit");
+        assertEq(address(rejecting).balance, AMOUNT, "recipient should receive the full deferred payout");
+    }
+
+    function test_RevertWhen_NoEscrowPayoutIsPending() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(JobEscrow.NoPayoutPending.selector, stranger));
+        jobEscrow.withdrawPayout();
     }
 
     /// The seller-at-fault dispute path also has nothing to slash at 0% ratio — the buyer

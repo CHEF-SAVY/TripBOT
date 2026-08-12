@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {IValidationRegistry} from "../interfaces/IValidationRegistry.sol";
+import {IIdentityRegistry} from "../interfaces/IIdentityRegistry.sol";
 
 /// @title ValidationRegistry — minimal ERC-8004 Validation Registry stand-in for BOT Chain
 /// @notice No ERC-8004 registry is deployed on BOT Chain testnet. This backs JobEscrow's
@@ -10,6 +11,8 @@ import {IValidationRegistry} from "../interfaces/IValidationRegistry.sol";
 /// only to what Tripwire's flow needs: a seller names a validator for a job, and that
 /// validator alone may respond.
 contract ValidationRegistry is IValidationRegistry {
+    IIdentityRegistry public immutable IDENTITY_REGISTRY;
+
     struct Request {
         bool exists;
         address validatorAddress;
@@ -26,9 +29,17 @@ contract ValidationRegistry is IValidationRegistry {
     error RequestAlreadyExists(bytes32 requestHash);
     error UnknownRequest(bytes32 requestHash);
     error NotValidator(bytes32 requestHash, address caller);
+    error NotAgentOwnerOrOperator(uint256 agentId, address caller);
+    error InvalidAddress();
+    error ResponseOutOfRange(uint8 response);
 
     mapping(bytes32 => Request) private _requests;
     uint256 private _nonce;
+
+    constructor(address identityRegistry_) {
+        if (identityRegistry_ == address(0) || identityRegistry_.code.length == 0) revert InvalidAddress();
+        IDENTITY_REGISTRY = IIdentityRegistry(identityRegistry_);
+    }
 
     /// @notice Seller-initiated: names `validatorAddress` (JobEscrow) as the sole party
     /// allowed to respond for `agentId`. Returns a fresh requestHash — never reused, since
@@ -37,6 +48,10 @@ contract ValidationRegistry is IValidationRegistry {
         external
         returns (bytes32 requestHash)
     {
+        if (validatorAddress == address(0)) revert InvalidAddress();
+        if (!IDENTITY_REGISTRY.isAuthorizedOrOwner(msg.sender, agentId)) {
+            revert NotAgentOwnerOrOperator(agentId, msg.sender);
+        }
         requestHash = keccak256(abi.encode(msg.sender, validatorAddress, agentId, requestURI, _nonce++));
         _requests[requestHash] = Request({
             exists: true,
@@ -58,6 +73,7 @@ contract ValidationRegistry is IValidationRegistry {
         bytes32 responseHash,
         string calldata tag
     ) external override {
+        if (response > 100) revert ResponseOutOfRange(response);
         Request storage r = _requests[requestHash];
         if (!r.exists) revert UnknownRequest(requestHash);
         if (msg.sender != r.validatorAddress) revert NotValidator(requestHash, msg.sender);

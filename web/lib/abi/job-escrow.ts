@@ -1,0 +1,100 @@
+// Generated from contracts/out/JobEscrow.sol/JobEscrow.json. Keep tuple order in sync
+// with JobEscrow.Job: it is part of the deployed ABI.
+export const jobEscrowAbi = [
+  {
+    type: "event",
+    name: "JobCreated",
+    inputs: [
+      { name: "jobId", type: "uint256", indexed: true },
+      { name: "buyer", type: "address", indexed: true },
+      { name: "sellerAgentId", type: "uint256", indexed: true },
+      { name: "amount", type: "uint256", indexed: false },
+      { name: "reservedBond", type: "uint256", indexed: false },
+      { name: "completionDeadline", type: "uint64", indexed: false },
+    ],
+  },
+  { type: "event", name: "JobReleased", inputs: [{ name: "jobId", type: "uint256", indexed: true }] },
+  {
+    type: "event",
+    name: "JobDisputed",
+    inputs: [
+      { name: "jobId", type: "uint256", indexed: true },
+      { name: "evidenceHash", type: "bytes32", indexed: false },
+    ],
+  },
+  {
+    type: "event",
+    name: "JobResolved",
+    inputs: [
+      { name: "jobId", type: "uint256", indexed: true },
+      { name: "sellerAtFault", type: "bool", indexed: false },
+    ],
+  },
+  { type: "event", name: "JobResolvedNeutral", inputs: [{ name: "jobId", type: "uint256", indexed: true }] },
+  { type: "event", name: "JobDisputeTimedOut", inputs: [{ name: "jobId", type: "uint256", indexed: true }] },
+  { type: "event", name: "JobTimedOut", inputs: [{ name: "jobId", type: "uint256", indexed: true }] },
+  { type: "function", name: "nextJobId", inputs: [], outputs: [{ type: "uint256" }], stateMutability: "view" },
+  { type: "function", name: "minBondRatioBps", inputs: [], outputs: [{ type: "uint256" }], stateMutability: "view" },
+  { type: "function", name: "responseWindow", inputs: [], outputs: [{ type: "uint64" }], stateMutability: "view" },
+  { type: "function", name: "validationRegistryEnabled", inputs: [], outputs: [{ type: "bool" }], stateMutability: "view" },
+  { type: "function", name: "jobCreationPaused", inputs: [], outputs: [{ type: "bool" }], stateMutability: "view" },
+  { type: "function", name: "sellerBond", inputs: [], outputs: [{ type: "address" }], stateMutability: "view" },
+  { type: "function", name: "ARBITER", inputs: [], outputs: [{ type: "address" }], stateMutability: "view" },
+  {
+    type: "function",
+    name: "jobs",
+    inputs: [{ type: "uint256" }],
+    outputs: [
+      { name: "buyer", type: "address" },
+      { name: "sellerAgentId", type: "uint256" },
+      { name: "sellerPayoutAddress", type: "address" },
+      { name: "amount", type: "uint256" },
+      { name: "reservedBond", type: "uint256" },
+      { name: "completionDeadline", type: "uint64" },
+      { name: "responseDeadline", type: "uint64" },
+      { name: "status", type: "uint8" },
+      { name: "validationRequestHash", type: "bytes32" },
+      { name: "evidenceHash", type: "bytes32" },
+    ],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "createJob",
+    inputs: [
+      { name: "sellerAgentId", type: "uint256" },
+      { name: "completionDeadline", type: "uint64" },
+      { name: "validationRequestHash", type: "bytes32" },
+    ],
+    outputs: [{ name: "jobId", type: "uint256" }],
+    stateMutability: "payable",
+  },
+  { type: "function", name: "release", inputs: [{ name: "jobId", type: "uint256" }], outputs: [], stateMutability: "nonpayable" },
+  {
+    type: "function",
+    name: "dispute",
+    inputs: [
+      { name: "jobId", type: "uint256" },
+      { name: "evidenceHash", type: "bytes32" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "resolveDispute",
+    inputs: [
+      { name: "jobId", type: "uint256" },
+      { name: "sellerAtFault", type: "bool" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "resolveDisputeNeutral",
+    inputs: [{ name: "jobId", type: "uint256" }],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+] as const;

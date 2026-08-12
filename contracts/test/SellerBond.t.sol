@@ -58,10 +58,22 @@ contract SellerBondTest is Test {
     /// registered agent owned by `seller`, who holds plenty of native BOT to stake.
     function setUp() public {
         registry = new MockIdentityRegistry();
+        // SellerBond rejects an EOA as its privileged escrow dependency. Give the isolated
+        // fixture address one STOP opcode so it has contract code while remaining inert.
+        vm.etch(jobEscrow, hex"00");
         bond = new SellerBond(address(registry), jobEscrow);
 
         registry.setAgentOwner(AGENT_ID, seller);
         vm.deal(seller, 10_000 ether);
+    }
+
+    // ------------------------------------------------------------------ constructor
+
+    function test_RevertWhen_ConstructorDependencyHasNoCode() public {
+        vm.expectRevert(SellerBond.InvalidAddress.selector);
+        new SellerBond(address(registry), stranger);
+        vm.expectRevert(SellerBond.InvalidAddress.selector);
+        new SellerBond(stranger, jobEscrow);
     }
 
     // ------------------------------------------------------------------ deposit
@@ -336,11 +348,9 @@ contract SellerBondTest is Test {
         bond.completeWithdrawal(AGENT_ID);
     }
 
-    /// If the current owner can't receive native value (e.g. a contract with no
-    /// receive/fallback), the whole withdrawal must revert rather than silently burning the
-    /// seller's stake — the same "money must move or nothing happens" guarantee SafeERC20
-    /// gave the USDC version, now enforced by NativeTransferFailed instead.
-    function test_RevertWhen_CompleteWithdrawalRecipientRejectsValue() public {
+    /// A receiver that rejects native value must not block the withdrawal state transition.
+    /// Its money is retained as a pullable credit instead of trapping every other operation.
+    function test_CompleteWithdrawalDefersRejectedPayout() public {
         RejectingReceiver rejecting = new RejectingReceiver();
         registry.setAgentOwner(AGENT_ID, address(rejecting));
         vm.deal(address(rejecting), STAKE);
@@ -354,7 +364,21 @@ contract SellerBondTest is Test {
         vm.warp(unlockTime);
 
         vm.prank(address(rejecting));
-        vm.expectRevert(abi.encodeWithSelector(SellerBond.NativeTransferFailed.selector, address(rejecting), WITHDRAW));
+        bond.completeWithdrawal(AGENT_ID);
+
+        assertEq(bond.pendingPayouts(address(rejecting)), WITHDRAW, "rejected BOT should become a pullable credit");
+        assertEq(bond.bondBalance(AGENT_ID), STAKE - WITHDRAW, "withdrawal accounting should still settle");
+        (uint256 pending,) = bond.pendingWithdrawal(AGENT_ID);
+        assertEq(pending, 0, "request should clear even when the push is rejected");
+    }
+
+    function test_RevertWhen_CompleteWithdrawalCallerLostAuthorization() public {
+        uint64 unlockTime = _depositAndRequest();
+        registry.setAgentOwner(AGENT_ID, newOwner);
+        vm.warp(unlockTime);
+
+        vm.prank(seller);
+        vm.expectRevert(abi.encodeWithSelector(SellerBond.NotAgentOwnerOrOperator.selector, AGENT_ID, seller));
         bond.completeWithdrawal(AGENT_ID);
     }
 
@@ -549,6 +573,20 @@ contract SellerBondTest is Test {
         assertEq(bond.bondBalance(AGENT_ID), STAKE - WITHDRAW, "gross stake should permanently shrink");
     }
 
+    function test_SlashDefersRejectedRecipientWithoutBlockingAccounting() public {
+        RejectingReceiver rejecting = new RejectingReceiver();
+        _deposit();
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+
+        vm.prank(jobEscrow);
+        bond.slash(AGENT_ID, WITHDRAW, address(rejecting));
+
+        assertEq(bond.pendingPayouts(address(rejecting)), WITHDRAW, "failed slash payout should become credit");
+        assertEq(bond.reserved(AGENT_ID), 0, "reservation accounting should settle");
+        assertEq(bond.bondBalance(AGENT_ID), STAKE - WITHDRAW, "slashed stake must remain removed");
+    }
+
     function test_RevertWhen_SlashByNonJobEscrow() public {
         _deposit();
         vm.prank(jobEscrow);
@@ -592,5 +630,49 @@ contract SellerBondTest is Test {
         vm.prank(seller);
         vm.expectRevert(abi.encodeWithSelector(SellerBond.InsufficientBond.selector, AGENT_ID, 1, 0));
         bond.requestWithdrawal(AGENT_ID, 1); // nothing free left to request
+    }
+
+    function test_OwnershipRotationRequiresPendingOwnerAcceptance() public {
+        bond.transferOwnership(newOwner);
+        assertEq(bond.owner(), address(this), "proposal must not transfer authority immediately");
+
+        vm.prank(stranger);
+        vm.expectRevert(SellerBond.NotPendingOwner.selector);
+        bond.acceptOwnership();
+
+        vm.prank(newOwner);
+        bond.acceptOwnership();
+        assertEq(bond.owner(), newOwner, "pending owner should take authority after acceptance");
+    }
+
+    function test_DeferredBondPayoutCanBePulledAfterReceiverBecomesCompatible() public {
+        RejectingReceiver rejecting = new RejectingReceiver();
+        _deposit();
+        vm.prank(jobEscrow);
+        bond.reserve(AGENT_ID, WITHDRAW);
+        vm.prank(jobEscrow);
+        bond.slash(AGENT_ID, WITHDRAW, address(rejecting));
+
+        vm.prank(address(rejecting));
+        vm.expectRevert(abi.encodeWithSelector(SellerBond.NativeTransferFailed.selector, address(rejecting), WITHDRAW));
+        bond.withdrawPayout();
+        assertEq(bond.pendingPayouts(address(rejecting)), WITHDRAW, "failed pull must retain the credit");
+
+        vm.etch(address(rejecting), hex"");
+        vm.prank(address(rejecting));
+        bond.withdrawPayout();
+        assertEq(bond.pendingPayouts(address(rejecting)), 0, "successful pull should consume the credit");
+        assertEq(address(rejecting).balance, WITHDRAW, "recipient should receive the slashed BOT");
+    }
+
+    function test_RevertWhen_NoBondPayoutIsPending() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(SellerBond.NoPayoutPending.selector, stranger));
+        bond.withdrawPayout();
+    }
+
+    function test_RevertWhen_ProposedOwnerIsZero() public {
+        vm.expectRevert(SellerBond.InvalidAddress.selector);
+        bond.transferOwnership(address(0));
     }
 }

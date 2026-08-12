@@ -4,6 +4,8 @@ pragma solidity ^0.8.24;
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 import {ISellerBond} from "./interfaces/ISellerBond.sol";
 import {IValidationRegistry} from "./interfaces/IValidationRegistry.sol";
+import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
+import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
 /// @title JobEscrow — one job, one escrowed native-BOT payment, released only on verified delivery
 /// @notice Buyer's BOT sits here until the buyer releases it, an arbiter resolves a dispute
@@ -20,7 +22,7 @@ import {IValidationRegistry} from "./interfaces/IValidationRegistry.sol";
 /// validationResponse attestation calls) points at minimal stand-in registries deployed
 /// alongside this contract — no ERC-8004 registry exists on BOT Chain testnet — see
 /// isValidationRequestValid and _attestValidation.
-contract JobEscrow {
+contract JobEscrow is ReentrancyGuard {
     // ----------------------------------------------------------------- types
 
     enum JobStatus {
@@ -73,9 +75,11 @@ contract JobEscrow {
     // MVP dispute resolution: a single arbiter address (the deployer wallet), disclosed in the
     // README as centralized-for-now. Separate from `owner` — same key for the hackathon, but a
     // one-line change to rotate later without touching risk-parameter ownership.
-    address public immutable ARBITER;
+    address public ARBITER;
 
     address public owner;
+    address public pendingOwner;
+    address public pendingArbiter;
     // Settable exactly once post-deploy (see setSellerBond) — resolves the circular
     // constructor dependency: JobEscrow needs SellerBond's address, but SellerBond's
     // JOB_ESCROW is immutable and needs JobEscrow's address. JobEscrow deploys first with
@@ -108,6 +112,11 @@ contract JobEscrow {
     // compromised owner key can freeze (a century-long window would make claimTimeout
     // meaningless), no minimum so a demo recording can shorten it to near-zero.
     uint64 public constant MAX_RESPONSE_WINDOW = 30 days;
+    /// @notice Maximum time a disputed job may wait for the arbiter before the buyer can
+    /// reclaim escrow and the seller's bond is released without a slash.
+    uint64 public arbitrationWindow = 7 days;
+    uint64 public constant MAX_ARBITRATION_WINDOW = 30 days;
+    bool public jobCreationPaused;
     // Hard ceiling on how far into the future a job's completionDeadline may be set, checked
     // in createJob. Two independent reasons this exists: (1) it bounds
     // completionDeadline + responseWindow (both uint64) well clear of type(uint64).max, so
@@ -125,6 +134,11 @@ contract JobEscrow {
     // ValidationRequestHashAlreadyUsed. Only populated when validationRegistryEnabled (see
     // createJob), so the disabled pathway's bytes32(0) placeholder never collides here.
     mapping(bytes32 => bool) public validationRequestHashUsed;
+    mapping(uint256 => bool) public validationRequiredForJob;
+    /// @notice Absolute arbiter deadline snapshotted when a dispute opens. Later risk-
+    /// parameter changes cannot accelerate or delay an in-flight dispute.
+    mapping(uint256 => uint64) public disputeDeadline;
+    mapping(address => uint256) public pendingPayouts;
 
     // ---------------------------------------------------------------- events
 
@@ -139,11 +153,21 @@ contract JobEscrow {
     event JobReleased(uint256 indexed jobId);
     event JobDisputed(uint256 indexed jobId, bytes32 evidenceHash);
     event JobResolved(uint256 indexed jobId, bool sellerAtFault);
+    event JobResolvedNeutral(uint256 indexed jobId);
     event JobTimedOut(uint256 indexed jobId);
     event SellerBondSet(address sellerBond);
     event MinBondRatioBpsUpdated(uint256 previous, uint256 current);
     event ResponseWindowUpdated(uint64 previous, uint64 current);
     event ValidationRegistryEnabledUpdated(bool previous, bool current);
+    event ArbitrationWindowUpdated(uint64 previous, uint64 current);
+    event JobCreationPausedUpdated(bool previous, bool current);
+    event JobDisputeTimedOut(uint256 indexed jobId);
+    event PayoutDeferred(address indexed recipient, uint256 amount);
+    event PayoutWithdrawn(address indexed recipient, uint256 amount);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed pendingOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event ArbiterTransferStarted(address indexed previousArbiter, address indexed pendingArbiter);
+    event ArbiterTransferred(address indexed previousArbiter, address indexed newArbiter);
 
     // ---------------------------------------------------------------- errors
 
@@ -176,6 +200,17 @@ contract JobEscrow {
     // uniqueness scope.
     error ValidationRequestHashAlreadyUsed(bytes32 requestHash);
     error NativeTransferFailed(address recipient, uint256 amount);
+    error InvalidAddress();
+    error InvalidContract(address target);
+    error SellerBondMisconfigured(address target);
+    error EvidenceHashRequired();
+    error ValidationHashMustBeZeroWhenDisabled(bytes32 requestHash);
+    error ArbitrationWindowTooLong(uint64 requested, uint64 max);
+    error ArbitrationWindowNotElapsed(uint256 jobId, uint64 claimableAfter);
+    error JobCreationIsPaused();
+    error NoPayoutPending(address recipient);
+    error NotPendingOwner();
+    error NotPendingArbiter();
 
     // ------------------------------------------------------------- modifiers
 
@@ -213,6 +248,13 @@ contract JobEscrow {
     // ----------------------------------------------------------- constructor
 
     constructor(address identityRegistry_, address validationRegistry_, address arbiter_) {
+        if (arbiter_ == address(0)) revert InvalidAddress();
+        if (identityRegistry_ == address(0) || identityRegistry_.code.length == 0) {
+            revert InvalidContract(identityRegistry_);
+        }
+        if (validationRegistry_ == address(0) || validationRegistry_.code.length == 0) {
+            revert InvalidContract(validationRegistry_);
+        }
         IDENTITY_REGISTRY = IIdentityRegistry(identityRegistry_);
         VALIDATION_REGISTRY = IValidationRegistry(validationRegistry_);
         ARBITER = arbiter_;
@@ -226,17 +268,25 @@ contract JobEscrow {
     /// in the Solidity keyword sense (it can't be, since it isn't known at construction).
     function setSellerBond(address sellerBond_) external onlyOwner {
         if (address(sellerBond) != address(0)) revert SellerBondAlreadySet();
-        sellerBond = ISellerBond(sellerBond_);
+        if (sellerBond_ == address(0) || sellerBond_.code.length == 0) revert InvalidContract(sellerBond_);
+        ISellerBond candidate = ISellerBond(sellerBond_);
+        if (candidate.JOB_ESCROW() != address(this) || candidate.IDENTITY_REGISTRY() != address(IDENTITY_REGISTRY)) {
+            revert SellerBondMisconfigured(sellerBond_);
+        }
+        sellerBond = candidate;
         emit SellerBondSet(sellerBond_);
     }
 
     /// @dev Shared native-value payout path: a low-level `call` (not `.transfer()`, which
     /// hard-caps forwarded gas at 2300 and can break on recipients with any non-trivial
-    /// receive/fallback logic) that reverts the whole transaction on failure — same "money
-    /// must move or nothing happens" guarantee SafeERC20 gave the USDC version.
-    function _payOut(address recipient, uint256 amount) private {
+    /// receive/fallback logic). A failed push becomes a pull-payment credit so an
+    /// incompatible recipient cannot block escrow settlement.
+    function _payOrCredit(address recipient, uint256 amount) private {
         (bool success,) = payable(recipient).call{value: amount}("");
-        if (!success) revert NativeTransferFailed(recipient, amount);
+        if (!success) {
+            pendingPayouts[recipient] += amount;
+            emit PayoutDeferred(recipient, amount);
+        }
     }
 
     /// @notice Buyer opens a job: validates msg.value/deadline, reserves the seller's bond,
@@ -253,6 +303,7 @@ contract JobEscrow {
         payable
         returns (uint256 jobId)
     {
+        if (jobCreationPaused) revert JobCreationIsPaused();
         uint256 amount = msg.value;
         if (amount == 0) revert ZeroAmount();
         if (completionDeadline <= block.timestamp) revert DeadlineNotInFuture(completionDeadline);
@@ -284,6 +335,8 @@ contract JobEscrow {
                 revert ValidationRequestHashAlreadyUsed(validationRequestHash);
             }
             validationRequestHashUsed[validationRequestHash] = true;
+        } else if (validationRequestHash != bytes32(0)) {
+            revert ValidationHashMustBeZeroWhenDisabled(validationRequestHash);
         }
 
         // Snapshotted now, not re-read at payout — see the Job struct's sellerPayoutAddress
@@ -295,7 +348,7 @@ contract JobEscrow {
         // released, or slashed for it, regardless of later minBondRatioBps changes. Can be
         // zero when minBondRatioBps is 0 (see the guard below) — a deliberately supported
         // demo/testing configuration, not an edge case to reject.
-        uint256 reservedBond = (amount * minBondRatioBps) / 10_000;
+        uint256 reservedBond = Math.mulDiv(amount, minBondRatioBps, 10_000, Math.Rounding.Ceil);
 
         jobId = nextJobId++;
         jobs[jobId] = Job({
@@ -312,6 +365,7 @@ contract JobEscrow {
             validationRequestHash: validationRequestHash,
             evidenceHash: bytes32(0)
         });
+        validationRequiredForJob[jobId] = validationRegistryEnabled;
 
         emit JobCreated(jobId, msg.sender, sellerAgentId, amount, reservedBond, completionDeadline);
 
@@ -332,8 +386,14 @@ contract JobEscrow {
     /// payout that's otherwise ready (invariant 3). Checks validationRegistryEnabled first
     /// so a known-disabled registry costs one SLOAD instead of a wasted external call that
     /// would just get swallowed anyway.
-    function _attestValidation(bytes32 requestHash, uint8 response, bytes32 responseHash, string memory tag) internal {
-        if (!validationRegistryEnabled) return;
+    function _attestValidation(
+        uint256 jobId,
+        bytes32 requestHash,
+        uint8 response,
+        bytes32 responseHash,
+        string memory tag
+    ) internal {
+        if (!validationRegistryEnabled || !validationRequiredForJob[jobId]) return;
         try VALIDATION_REGISTRY.validationResponse(requestHash, response, "", responseHash, tag) {} catch {}
     }
 
@@ -341,7 +401,7 @@ contract JobEscrow {
     /// reservation. Only callable by the job's buyer, while Active, and only up to the
     /// job's snapshotted responseDeadline — past that point only claimTimeout applies
     /// (invariant 4: the two windows are mutually exclusive by construction).
-    function release(uint256 jobId) external onlyBuyer(jobId) {
+    function release(uint256 jobId) external onlyBuyer(jobId) nonReentrant {
         Job storage job = jobs[jobId];
         if (job.status != JobStatus.Active) revert JobNotActive(jobId, job.status);
         if (block.timestamp >= job.responseDeadline) {
@@ -356,8 +416,8 @@ contract JobEscrow {
         if (job.reservedBond > 0) {
             sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
         }
-        _payOut(job.sellerPayoutAddress, job.amount);
-        _attestValidation(job.validationRequestHash, 100, bytes32(0), "RELEASED");
+        _payOrCredit(job.sellerPayoutAddress, job.amount);
+        _attestValidation(jobId, job.validationRequestHash, 100, bytes32(0), "RELEASED");
     }
 
     /// @notice Buyer disputes instead of releasing: records evidenceHash on-chain (the hash,
@@ -371,9 +431,11 @@ contract JobEscrow {
         if (block.timestamp >= job.responseDeadline) {
             revert ResponseWindowElapsed(jobId, job.responseDeadline);
         }
+        if (evidenceHash == bytes32(0)) revert EvidenceHashRequired();
 
         job.status = JobStatus.Disputed;
         job.evidenceHash = evidenceHash;
+        disputeDeadline[jobId] = uint64(block.timestamp) + arbitrationWindow;
         emit JobDisputed(jobId, evidenceHash);
     }
 
@@ -381,8 +443,9 @@ contract JobEscrow {
     /// the buyer and separately refunds the escrowed amount; sellerAtFault=false pays the
     /// seller as if released normally. MVP: single arbiter address, disclosed as
     /// centralized-for-now. Unlike Active jobs there is no timeout rescue once Disputed — a
-    /// disallowed dispute sits until the arbiter acts.
-    function resolveDispute(uint256 jobId, bool sellerAtFault) external onlyArbiter {
+    /// a dispute cannot lock funds forever because claimDisputeTimeout provides a neutral
+    /// liveness backstop after the deadline snapshotted when the dispute was opened.
+    function resolveDispute(uint256 jobId, bool sellerAtFault) external onlyArbiter nonReentrant {
         Job storage job = jobs[jobId];
         if (job.status != JobStatus.Disputed) revert JobNotDisputed(jobId, job.status);
 
@@ -397,27 +460,44 @@ contract JobEscrow {
             if (job.reservedBond > 0) {
                 sellerBond.slash(job.sellerAgentId, job.reservedBond, job.buyer);
             }
-            _payOut(job.buyer, job.amount);
+            _payOrCredit(job.buyer, job.amount);
             // responseHash carries the buyer's actual dispute evidence hash here (not
             // bytes32(0), unlike the other three attestation call sites) — this is what
             // makes the at-fault attestation genuinely content-addressed and checkable by
             // other systems, not just a bare score.
-            _attestValidation(job.validationRequestHash, 0, job.evidenceHash, "SELLER_AT_FAULT");
+            _attestValidation(jobId, job.validationRequestHash, 0, job.evidenceHash, "SELLER_AT_FAULT");
         } else {
             // The dispute didn't find the seller at fault, so they're paid exactly as if
             // the buyer had called release() — same two calls, same amounts.
             if (job.reservedBond > 0) {
                 sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
             }
-            _payOut(job.sellerPayoutAddress, job.amount);
-            _attestValidation(job.validationRequestHash, 100, bytes32(0), "DISPUTE_RESOLVED_SELLER");
+            _payOrCredit(job.sellerPayoutAddress, job.amount);
+            _attestValidation(jobId, job.validationRequestHash, 100, bytes32(0), "DISPUTE_RESOLVED_SELLER");
         }
+    }
+
+    /// @notice Resolve without assigning seller fault. This is deliberately distinct from
+    /// `sellerAtFault=false`, which means the seller prevailed and should be paid. Neutral
+    /// resolution is for a proven gateway/infrastructure failure: refund the buyer, release
+    /// the seller's collateral without a slash, and record an indeterminate attestation.
+    function resolveDisputeNeutral(uint256 jobId) external onlyArbiter nonReentrant {
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Disputed) revert JobNotDisputed(jobId, job.status);
+
+        job.status = JobStatus.Resolved;
+        emit JobResolvedNeutral(jobId);
+        if (job.reservedBond > 0) {
+            sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+        }
+        _payOrCredit(job.buyer, job.amount);
+        _attestValidation(jobId, job.validationRequestHash, 50, job.evidenceHash, "NEUTRAL_INFRASTRUCTURE");
     }
 
     /// @notice Anyone may trigger auto-release to the seller once the job's snapshotted
     /// responseDeadline has passed with the buyer having done nothing — without this a buyer
     /// could grief a seller forever by simply not responding.
-    function claimTimeout(uint256 jobId) external {
+    function claimTimeout(uint256 jobId) external nonReentrant {
         Job storage job = jobs[jobId];
         if (job.status != JobStatus.Active) revert JobNotActive(jobId, job.status);
         if (block.timestamp < job.responseDeadline) {
@@ -430,12 +510,29 @@ contract JobEscrow {
         if (job.reservedBond > 0) {
             sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
         }
-        _payOut(job.sellerPayoutAddress, job.amount);
+        _payOrCredit(job.sellerPayoutAddress, job.amount);
         // response=50, not 100: a timeout means the buyer simply never responded, not that
         // delivery was confirmed good. Scoring it identically to a real release() would
         // overclaim quality nobody actually verified; 50 reads as "indeterminate" on the
         // registry's 0-100 scale.
-        _attestValidation(job.validationRequestHash, 50, bytes32(0), "TIMED_OUT");
+        _attestValidation(jobId, job.validationRequestHash, 50, bytes32(0), "TIMED_OUT");
+    }
+
+    /// @notice Liveness backstop for an unavailable arbiter. The buyer gets its escrow back,
+    /// while the seller's reservation is released without a slash because fault was never adjudicated.
+    function claimDisputeTimeout(uint256 jobId) external nonReentrant {
+        Job storage job = jobs[jobId];
+        if (job.status != JobStatus.Disputed) revert JobNotDisputed(jobId, job.status);
+        uint64 claimableAfter = disputeDeadline[jobId];
+        if (block.timestamp < claimableAfter) revert ArbitrationWindowNotElapsed(jobId, claimableAfter);
+
+        job.status = JobStatus.Resolved;
+        emit JobDisputeTimedOut(jobId);
+        if (job.reservedBond > 0) {
+            sellerBond.releaseReservation(job.sellerAgentId, job.reservedBond);
+        }
+        _payOrCredit(job.buyer, job.amount);
+        _attestValidation(jobId, job.validationRequestHash, 50, job.evidenceHash, "ARBITRATION_TIMED_OUT");
     }
 
     /// @notice Update the risk parameter controlling how much bond a job requires, as a
@@ -470,6 +567,57 @@ contract JobEscrow {
     function setValidationRegistryEnabled(bool enabled_) external onlyOwner {
         emit ValidationRegistryEnabledUpdated(validationRegistryEnabled, enabled_);
         validationRegistryEnabled = enabled_;
+    }
+
+    function setArbitrationWindow(uint64 newWindow) external onlyOwner {
+        if (newWindow > MAX_ARBITRATION_WINDOW) {
+            revert ArbitrationWindowTooLong(newWindow, MAX_ARBITRATION_WINDOW);
+        }
+        emit ArbitrationWindowUpdated(arbitrationWindow, newWindow);
+        arbitrationWindow = newWindow;
+    }
+
+    /// @notice Emergency brake for new risk only. Existing release/dispute/timeout paths remain live.
+    function setJobCreationPaused(bool paused) external onlyOwner {
+        emit JobCreationPausedUpdated(jobCreationPaused, paused);
+        jobCreationPaused = paused;
+    }
+
+    function withdrawPayout() external nonReentrant {
+        uint256 amount = pendingPayouts[msg.sender];
+        if (amount == 0) revert NoPayoutPending(msg.sender);
+        pendingPayouts[msg.sender] = 0;
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        if (!success) revert NativeTransferFailed(msg.sender, amount);
+        emit PayoutWithdrawn(msg.sender, amount);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert InvalidAddress();
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner();
+        address previous = owner;
+        owner = msg.sender;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(previous, msg.sender);
+    }
+
+    function transferArbiter(address newArbiter) external onlyOwner {
+        if (newArbiter == address(0)) revert InvalidAddress();
+        pendingArbiter = newArbiter;
+        emit ArbiterTransferStarted(ARBITER, newArbiter);
+    }
+
+    function acceptArbiter() external {
+        if (msg.sender != pendingArbiter) revert NotPendingArbiter();
+        address previous = ARBITER;
+        ARBITER = msg.sender;
+        pendingArbiter = address(0);
+        emit ArbiterTransferred(previous, msg.sender);
     }
 
     /// @notice True if `requestHash` names this JobEscrow as validator for `sellerAgentId`

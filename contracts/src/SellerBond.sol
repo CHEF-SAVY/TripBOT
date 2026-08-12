@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
+import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
 /// @title SellerBond — slashable native-BOT stake keyed by ERC-8004 agentId
 /// @notice Sellers post native BOT stake against their agentId before they're eligible to
@@ -14,7 +15,7 @@ import {IIdentityRegistry} from "./interfaces/IIdentityRegistry.sol";
 /// unlike Arc, where USDC is the native gas token with a fixed pseudo-ERC20 interface at
 /// 0x3600...0000. There is no token contract here at all: deposits arrive as `msg.value`,
 /// payouts go out via a low-level `call` carrying value.
-contract SellerBond {
+contract SellerBond is ReentrancyGuard {
     // ----------------------------------------------------------------- types
 
     struct WithdrawalRequest {
@@ -30,6 +31,7 @@ contract SellerBond {
     address public immutable JOB_ESCROW;
 
     address public owner;
+    address public pendingOwner;
     /// @notice Hard ceiling on `withdrawalTimelock`. Bounds what a compromised owner key
     /// can do: without it, the owner could set a century-long timelock and effectively
     /// freeze every *future* withdrawal request (in-flight ones are safe — they snapshot).
@@ -46,6 +48,9 @@ contract SellerBond {
     mapping(uint256 => uint256) public reserved;
     /// agentId => at most one in-flight timelocked withdrawal
     mapping(uint256 => WithdrawalRequest) public pendingWithdrawal;
+    /// @notice Native BOT that could not be pushed to a recipient. A failed receiver can
+    /// never block bond accounting or settlement; it can pull the credit later.
+    mapping(address => uint256) public pendingPayouts;
 
     // ---------------------------------------------------------------- events
 
@@ -56,6 +61,10 @@ contract SellerBond {
     event ReservationReleased(uint256 indexed agentId, uint256 amount);
     event Slashed(uint256 indexed agentId, address indexed recipient, uint256 amount);
     event WithdrawalTimelockUpdated(uint64 previous, uint64 current);
+    event PayoutDeferred(address indexed recipient, uint256 amount);
+    event PayoutWithdrawn(address indexed recipient, uint256 amount);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed pendingOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     // ---------------------------------------------------------------- errors
 
@@ -70,6 +79,9 @@ contract SellerBond {
     error TimelockNotExpired(uint256 agentId, uint64 unlockTime);
     error TimelockTooLong(uint64 requested, uint64 max);
     error NativeTransferFailed(address recipient, uint256 amount);
+    error InvalidAddress();
+    error NoPayoutPending(address recipient);
+    error NotPendingOwner();
 
     // ------------------------------------------------------------- modifiers
 
@@ -102,6 +114,12 @@ contract SellerBond {
     // ----------------------------------------------------------- constructor
 
     constructor(address identityRegistry_, address jobEscrow_) {
+        if (
+            identityRegistry_ == address(0) || identityRegistry_.code.length == 0 || jobEscrow_ == address(0)
+                || jobEscrow_.code.length == 0
+        ) {
+            revert InvalidAddress();
+        }
         IDENTITY_REGISTRY = IIdentityRegistry(identityRegistry_);
         JOB_ESCROW = jobEscrow_;
         owner = msg.sender;
@@ -111,11 +129,14 @@ contract SellerBond {
 
     /// @dev Shared native-value payout path: a low-level `call` (not `.transfer()`,
     /// which hard-caps forwarded gas at 2300 and can break on recipients with any
-    /// non-trivial receive/fallback logic) that reverts the whole transaction on failure —
-    /// same "money must move or nothing happens" guarantee SafeERC20 gave the USDC version.
-    function _payOut(address recipient, uint256 amount) private {
+    /// non-trivial receive/fallback logic). A failed push becomes a pull-payment credit so
+    /// an incompatible recipient cannot block withdrawal or dispute settlement.
+    function _payOrCredit(address recipient, uint256 amount) private {
         (bool success,) = payable(recipient).call{value: amount}("");
-        if (!success) revert NativeTransferFailed(recipient, amount);
+        if (!success) {
+            pendingPayouts[recipient] += amount;
+            emit PayoutDeferred(recipient, amount);
+        }
     }
 
     /// @notice Post stake: credits `msg.value` native BOT to `agentId`'s bond. Restricted
@@ -193,7 +214,7 @@ contract SellerBond {
     /// @dev Completion is always fundable: slash() only ever consumes *reserved* bond, and
     /// the pending amount was subtracted from bondOf() the moment it was requested, so
     /// nothing that happens during the timelock can spend it out from under the seller.
-    function completeWithdrawal(uint256 agentId) external {
+    function completeWithdrawal(uint256 agentId) external nonReentrant {
         if (!IDENTITY_REGISTRY.isAuthorizedOrOwner(msg.sender, agentId)) {
             revert NotAgentOwnerOrOperator(agentId, msg.sender);
         }
@@ -222,7 +243,7 @@ contract SellerBond {
         bondBalance[agentId] -= request.amount;
         emit WithdrawalCompleted(agentId, recipient, request.amount);
 
-        _payOut(recipient, request.amount);
+        _payOrCredit(recipient, request.amount);
     }
 
     /// @notice Lock `amount` of the agent's free bond for a job. Only JobEscrow.
@@ -263,8 +284,9 @@ contract SellerBond {
     /// free bond, only what was locked for the job being resolved.
     /// @dev Both bondBalance and reserved drop together: the stake is gone for good, not
     /// just unreserved, so it can never be double-counted toward a later job or withdrawal.
-    function slash(uint256 agentId, uint256 amount, address recipient) external onlyJobEscrow {
+    function slash(uint256 agentId, uint256 amount, address recipient) external onlyJobEscrow nonReentrant {
         if (amount == 0) revert ZeroAmount();
+        if (recipient == address(0)) revert InvalidAddress();
 
         uint256 currentlyReserved = reserved[agentId];
         if (amount > currentlyReserved) {
@@ -276,7 +298,7 @@ contract SellerBond {
         reserved[agentId] = currentlyReserved - amount;
         emit Slashed(agentId, recipient, amount);
 
-        _payOut(recipient, amount);
+        _payOrCredit(recipient, amount);
     }
 
     /// @notice Free bond available to new jobs or withdrawal requests.
@@ -301,5 +323,30 @@ contract SellerBond {
         }
         emit WithdrawalTimelockUpdated(withdrawalTimelock, newTimelock);
         withdrawalTimelock = newTimelock;
+    }
+
+    /// @notice Pull a payout that was deferred because this address rejected native BOT.
+    function withdrawPayout() external nonReentrant {
+        uint256 amount = pendingPayouts[msg.sender];
+        if (amount == 0) revert NoPayoutPending(msg.sender);
+        pendingPayouts[msg.sender] = 0;
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        if (!success) revert NativeTransferFailed(msg.sender, amount);
+        emit PayoutWithdrawn(msg.sender, amount);
+    }
+
+    /// @notice Begin a two-step owner rotation so a typo cannot permanently seize admin control.
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert InvalidAddress();
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert NotPendingOwner();
+        address previous = owner;
+        owner = msg.sender;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(previous, msg.sender);
     }
 }
