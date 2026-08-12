@@ -136,6 +136,20 @@ export async function claimResolution(id: string, visitorHash: string, ipHash: s
   });
 }
 
+export async function claimSignerLease(role: string, holder: string, ttlSeconds: number): Promise<boolean> {
+  return request<boolean>("rpc/claim_signer_lease", {
+    method: "POST",
+    body: JSON.stringify({ p_role: role, p_holder: holder, p_ttl_seconds: ttlSeconds }),
+  });
+}
+
+export async function releaseSignerLease(role: string, holder: string): Promise<boolean> {
+  return request<boolean>("rpc/release_signer_lease", {
+    method: "POST",
+    body: JSON.stringify({ p_role: role, p_holder: holder }),
+  });
+}
+
 export async function claimDelivery(row: Record<string, Json>): Promise<boolean> {
   try {
     await request("job_deliveries", {
