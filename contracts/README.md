@@ -46,8 +46,27 @@ value — unlike Arc, where USDC is the native gas token behind a fixed pseudo-E
 at `0x3600...0000`. Every escrowed/staked amount here is plain native value (`msg.value`,
 `.call{value: ...}`), not an ERC-20 transfer.
 
-Mainnet (chain ID `677`, `https://rpc.botchain.ai`) is deliberately not configured — this
-project is testnet-only.
+Mainnet (chain ID `677`, `https://rpc.botchain.ai`) is configured as `bot_mainnet` and the
+contracts are deployed there:
+
+```
+IdentityRegistry:   0x9e0F863AE8165688c6e5Ec335236bD459f2DdC8b
+ValidationRegistry: 0xA29b9F92Eb6A64B9371F86f80e458743341c6c9F
+JobEscrow:          0x627853Ddf094172913f23366839A86DF3d1Aa5bB
+SellerBond:         0x3A40b1dd835f271e2E67C5b2AEb82F27D4d5ec5D
+Arbiter/Owner:      0xC9DF311Af34f6a9cD1A406776F5F88798Fe615a6
+```
+
+Wiring was verified on-chain after the run, and the deployed bytecode is the hardened source
+in this repository — `claimDisputeTimeout` answers on 677, which the superseded first testnet
+deployment does not have.
+
+Those addresses match this project's first testnet deployment exactly, because contract
+addresses derive from deployer and nonce and the deployer began at nonce zero on both chains.
+Different chains, different bytecode.
+
+The funded web demo deliberately stays on testnet: it spends a server-held wallet, which suits
+play money and does not suit real funds.
 
 Current deployment on `scan.bohr.life`:
 

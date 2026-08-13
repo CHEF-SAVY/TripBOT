@@ -5,7 +5,7 @@ import { identityRegistryAbi } from "./abi/identity-registry";
 import { jobEscrowAbi } from "./abi/job-escrow";
 import { sellerBondAbi } from "./abi/seller-bond";
 import { validationRegistryAbi } from "./abi/validation-registry";
-import { envAddress, publicClient } from "./chain";
+import { envAddress, publicClient, warmRpc } from "./chain";
 import { getJob, JobStatus } from "./jobs";
 import { assertDemoWriteReady } from "./security/readiness";
 import { accountFor, walletFor, withSignerLock } from "./wallets";
@@ -147,6 +147,7 @@ export async function resolveNeutralDispute(jobId: bigint, evidenceHash: Hex) {
 
 export async function preflightDemo(agentId: bigint, price: bigint) {
   assertDemoWriteReady();
+  await warmRpc();
   const escrow = envAddress("JOB_ESCROW_ADDRESS");
   const sellerBond = envAddress("SELLER_BOND_ADDRESS");
   const buyer = accountFor("buyer").address;

@@ -2,17 +2,18 @@ import { NextResponse } from "next/server";
 import { getBalance } from "viem/actions";
 import { isAddress } from "viem";
 import { jobEscrowAbi } from "@/lib/abi/job-escrow";
-import { bot, envAddress, publicClient } from "@/lib/chain";
+import { bot, envAddress, publicClient, warmRpc } from "@/lib/chain";
 import { JobStatus, readJobPage } from "@/lib/jobs";
+import { withLastGood } from "@/lib/last-good";
 import { demoWriteReadiness } from "@/lib/security/readiness";
 
 export const dynamic = "force-dynamic";
 
-let cache: { at: number; value: unknown } | undefined;
-
 export async function GET() {
-  if (cache && Date.now() - cache.at < 5_000) return NextResponse.json(cache.value);
-  try {
+  // Longer than the old five seconds: every miss costs a round of calls to an RPC that has
+  // been taking seconds per connection, and this figure changes only when the chain does.
+  const { body, ok } = await withLastGood("state", 15_000, async () => {
+    await warmRpc();
     const escrow = envAddress("JOB_ESCROW_ADDRESS");
     const buyerAddress = process.env.BUYER_ADDRESS;
     const [jobPage, ratio, responseWindow, registryEnabled, sellerBond, arbiter, buyerBalance] = await Promise.all([
@@ -33,7 +34,7 @@ export async function GET() {
       0n,
     );
     const readiness = demoWriteReadiness();
-    const value = {
+    return {
       chain: { id: 968, name: "BOT Chain Testnet", explorer: "https://scan.bohr.life" },
       totalJobs: jobPage.total.toString(),
       visibleJobs: jobPage.jobs.length,
@@ -50,10 +51,7 @@ export async function GET() {
       identities: { jobEscrow: escrow, sellerBond, arbiter },
       updatedAt: new Date().toISOString(),
     };
-    cache = { at: Date.now(), value };
-    return NextResponse.json(value);
-  } catch (error) {
-    console.error("Failed to read live BOT Chain state", error);
-    return NextResponse.json({ error: "BOT Chain state is temporarily unavailable." }, { status: 503 });
-  }
+  });
+  if (!ok) return NextResponse.json({ error: "BOT Chain state is temporarily unavailable." }, { status: 503 });
+  return NextResponse.json(body);
 }

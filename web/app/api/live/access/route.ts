@@ -38,9 +38,16 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ authorized: false, reason: "read-only" });
   }
 
-  // Still rate limited, now against issuing identities rather than guessing a secret.
-  if (!(await claimAccessAttempt(ipHash))) {
-    return NextResponse.json({ authorized: false, reason: "rate-limited" }, { status: 429 });
+  // Still rate limited, now against issuing identities rather than guessing a secret. A
+  // storage hiccup here must degrade to read-only rather than throwing a 500 at a visitor
+  // who has done nothing wrong.
+  try {
+    if (!(await claimAccessAttempt(ipHash))) {
+      return NextResponse.json({ authorized: false, reason: "rate-limited" }, { status: 429 });
+    }
+  } catch (error) {
+    console.error("Access limiter unavailable", error);
+    return NextResponse.json({ authorized: false, reason: "unavailable" });
   }
 
   const { token, claims } = issueAccessToken(ipHash);

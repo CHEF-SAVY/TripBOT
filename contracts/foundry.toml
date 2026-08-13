@@ -25,3 +25,8 @@ chain_id = 968
 
 [rpc_endpoints]
 bot_testnet = "https://rpc.bohr.life"
+# Mainnet was deliberately left unconfigured for most of this project's life, on the basis
+# that the submission was testnet-only. That changed: the challenge requires a mainnet
+# deployment, so the contracts ship to 677 as the real artifact. The funded judge session
+# stays on testnet, so no visitor-facing path can move mainnet funds.
+bot_mainnet = "https://rpc.botchain.ai"

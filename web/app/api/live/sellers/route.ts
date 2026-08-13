@@ -1,13 +1,15 @@
 import { NextResponse } from "next/server";
 import { jobEscrowAbi } from "@/lib/abi/job-escrow";
-import { bot, envAddress, publicClient } from "@/lib/chain";
+import { bot, envAddress, publicClient, warmRpc } from "@/lib/chain";
 import { readBond } from "@/lib/jobs";
+import { withLastGood } from "@/lib/last-good";
 import { getSellers } from "@/lib/sellers";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  try {
+  const { body, ok } = await withLastGood("sellers", 20_000, async () => {
+    await warmRpc();
     // The bond ratio is an owner-settable risk parameter, so the amount a buyer stands to
     // recover is derived from the chain rather than assumed, using the same round-up the
     // escrow applies when it reserves collateral.
@@ -36,9 +38,8 @@ export async function GET() {
         };
       }),
     );
-    return NextResponse.json({ sellers, updatedAt: new Date().toISOString() });
-  } catch (error) {
-    console.error("Failed to read seller catalogue", error);
-    return NextResponse.json({ error: "Seller bond state is temporarily unavailable." }, { status: 503 });
-  }
+    return { sellers, updatedAt: new Date().toISOString() };
+  });
+  if (!ok) return NextResponse.json({ error: "Seller bond state is temporarily unavailable." }, { status: 503 });
+  return NextResponse.json(body);
 }
