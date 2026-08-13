@@ -16,7 +16,7 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
         </div>
         {children}
         <footer className="site-footer">
-          <span>TripBOT · BOT Chain testnet only</span>
+          <span>TripBOT · contracts on BOT Chain mainnet · demo runs on testnet</span>
           <span>Centralized demo arbiter · ERC-8004-inspired stand-ins</span>
         </footer>
       </body>
