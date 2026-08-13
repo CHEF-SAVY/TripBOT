@@ -30,8 +30,17 @@ body {
   background-size: auto, auto, 40px 40px, 40px 40px, auto;
   position: relative;
 }
-body::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .24; background-image: radial-gradient(rgba(255,255,255,.22) .55px, transparent .7px); background-size: 5px 5px; mask-image: linear-gradient(to bottom, #000, transparent 92%); }
-body::after { content: ""; position: fixed; inset: 0; z-index: -2; pointer-events: none; background: radial-gradient(ellipse at 50% -10%, transparent 25%, rgba(0,0,0,.5) 82%); }
+body::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .9;
+  background-image:
+    radial-gradient(1.6px 1.6px at 40px 70px, rgba(255,255,255,.55), transparent 100%),
+    radial-gradient(1px 1px at 180px 30px, rgba(255,255,255,.34), transparent 100%),
+    radial-gradient(1.9px 1.9px at 300px 210px, rgba(169,244,238,.42), transparent 100%),
+    radial-gradient(1px 1px at 90px 260px, rgba(255,255,255,.28), transparent 100%),
+    radial-gradient(1.3px 1.3px at 250px 120px, rgba(255,255,255,.4), transparent 100%),
+    radial-gradient(1px 1px at 420px 340px, rgba(169,244,238,.26), transparent 100%);
+  background-size: 430px 430px, 370px 370px, 560px 560px, 320px 320px, 480px 480px, 620px 620px; }
+body::after { content: ""; position: fixed; inset: 0; z-index: -2; pointer-events: none;
+  background: radial-gradient(ellipse at 50% 0%, rgba(169,244,238,.05), transparent 60%); }
 
 a { color: inherit; text-decoration: none; }
 button, input { font: inherit; }
@@ -116,7 +125,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--lime); outline-
 .problem-grid i { position: absolute; right: -5px; bottom: -32px; color: rgba(255,255,255,.07); font: 900 126px/.8 var(--font-mono); font-style: normal; letter-spacing: -.15em; }
 .problem-grid > .reveal:nth-child(2) { transform: translateY(32px); }.problem-grid > .reveal:nth-child(2):hover { transform: translateY(22px); }.problem-grid > .reveal:nth-child(3) { transform: translateY(8px); }.problem-grid > .reveal:nth-child(3):hover { transform: translateY(-2px); }
 
-.cause-section { position: relative; padding: 80px 0; overflow: hidden; background: radial-gradient(ellipse at 76% 50%, rgba(255,255,255,.055), transparent 25rem), linear-gradient(180deg, rgba(255,255,255,.018), transparent 42%, rgba(255,255,255,.012)); }
+.cause-section { position: relative; padding: 80px 0; overflow: hidden; }
 .cause-section::after { content: ""; position: absolute; left: -10%; right: -10%; bottom: 9%; height: 1px; background: linear-gradient(90deg, transparent, rgba(255,255,255,.08), transparent); transform: rotate(-4deg); pointer-events: none; }
 .cause-layout { display: grid; grid-template-columns: .8fr 1.2fr; gap: 64px; align-items: center; }
 .cause-copy > p:last-child { margin-top: 26px; color: var(--muted); line-height: 1.75; }
@@ -129,7 +138,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--lime); outline-
 .failure-chain span { color: var(--cyan); font: 8px var(--font-mono); }.failure-chain .danger span { color: var(--ink); }
 .failure-chain strong { margin-top: 46px; font: 10px var(--font-mono); letter-spacing: .12em; }.failure-chain small { margin-top: 6px; color: var(--muted); font-size: 9px; }.failure-chain > i { position: relative; z-index: 2; color: var(--muted); font-style: normal; }
 
-.solution-section { position: relative; padding: 76px 0 84px; overflow: hidden; background: radial-gradient(ellipse at 12% 45%, rgba(169,244,238,.055), transparent 24rem); }.solution-heading { max-width: 880px; }.solution-heading > p:last-child { max-width: 600px; margin-top: 22px; font-size: 15px; }
+.solution-section { position: relative; padding: 76px 0 84px; overflow: hidden; }.solution-heading { max-width: 880px; }.solution-heading > p:last-child { max-width: 600px; margin-top: 22px; font-size: 15px; }
 .solution-map { margin-top: 54px; display: grid; gap: 20px; }
 .solution-map article { position: relative; min-height: 104px; padding: 18px 68px 18px 0; display: grid; grid-template-columns: 120px 1fr; gap: 26px; align-items: center; overflow: hidden; border: 0; background: transparent; box-shadow: none; backdrop-filter: none; -webkit-backdrop-filter: none; transition: transform .35s ease, background .35s ease; }
 .solution-map article::before { content: ""; position: absolute; left: 0; top: 50%; width: 5px; height: 5px; border-radius: 50%; background: rgba(169,244,238,.45); box-shadow: 0 0 14px rgba(169,244,238,.25); transform: translateY(-50%); transition: transform .35s ease, background .35s ease, box-shadow .35s ease; }
@@ -151,7 +160,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--lime); outline-
 .journey-card i { position: relative; z-index: 1; display: block; width: 8px; height: 8px; margin: 20px 0 34px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 16px var(--cyan); }
 .journey-card h3 { font-size: 19px; margin: 0 0 8px; }.journey-card p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 
-.mechanism-showcase { position: relative; padding: 76px 0 84px; overflow: hidden; background: radial-gradient(ellipse at 50% 66%, rgba(255,255,255,.065), transparent 30rem), #080808; }
+.mechanism-showcase { position: relative; padding: 76px 0 84px; overflow: hidden; }
 .mechanism-showcase::before { content: "SETTLEMENT"; position: absolute; left: 50%; top: 25%; color: rgba(255,255,255,.018); transform: translateX(-50%); font: 900 clamp(90px, 16vw, 210px)/.8 var(--font-sans); letter-spacing: -.1em; white-space: nowrap; pointer-events: none; }
 .showcase-heading { text-align: center; }.showcase-heading h2 { margin-inline: auto; }
 .protocol-carousel { width: min(1080px, calc(100% - 40px)); margin: 56px auto 0; perspective: 1500px; }
@@ -170,7 +179,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--lime); outline-
 .slide-glyph { position: relative; z-index: 2; justify-self: end; width: min(24vw, 250px); aspect-ratio: 1; display: grid; place-items: center; border: 1px solid rgba(169,244,238,.15); background: radial-gradient(circle, rgba(169,244,238,.1), transparent 60%); transform: rotate(45deg); }.slide-glyph::before, .slide-glyph::after { content: ""; position: absolute; inset: 13%; border: 1px solid rgba(169,244,238,.12); }.slide-glyph::after { inset: 27%; }.slide-glyph span { transform: rotate(-45deg); color: rgba(242,243,241,.8); font: 300 70px/1 monospace; }.violet .slide-glyph { border-color: rgba(255,255,255,.18); background: radial-gradient(circle, rgba(255,255,255,.1), transparent 60%); }.amber .slide-glyph { border-color: rgba(255,203,102,.18); background: radial-gradient(circle, rgba(255,203,102,.1), transparent 60%); }
 .carousel-controls { display: flex; justify-content: center; gap: 8px; margin-top: 28px; }.carousel-controls button { width: 34px; height: 20px; padding: 0; border: 0; background: transparent; cursor: pointer; }.carousel-controls span { display: block; height: 2px; background: #344044; transition: background .2s, box-shadow .2s; }.carousel-controls button[aria-selected="true"] span { background: var(--cyan); box-shadow: 0 0 10px var(--cyan); }
 
-.stack-section { position: relative; padding: 76px 0 84px; overflow: hidden; background: radial-gradient(ellipse at 88% 55%, rgba(169,244,238,.045), transparent 28rem); }
+.stack-section { position: relative; padding: 76px 0 84px; overflow: hidden; }
 .stack-map { width: min(980px, 100%); margin: 58px auto 0; perspective: 1200px; }.stack-map > .reveal { margin-top: -1px; }
 .stack-layer { position: relative; min-height: 92px; padding: 20px 0; display: grid; grid-template-columns: 42px 1fr auto; gap: 18px; align-items: center; border: 0; border-bottom: 1px solid rgba(255,255,255,.12); background: transparent; box-shadow: none; transform: perspective(900px) rotateX(1.2deg); transition: transform .25s ease, border-color .25s ease; }
 .stack-layer::before { content: ""; position: absolute; left: 0; bottom: -1px; width: 0; height: 2px; background: var(--cyan); transition: width .3s ease; }.stack-layer:hover { z-index: 3; transform: translateY(-5px) scale(1.012); border-color: rgba(169,244,238,.35); }.stack-layer:hover::before { width: 100%; }
