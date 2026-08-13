@@ -35,8 +35,13 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
     console.error("Demo storage request failed", response.status, body);
     throw new Error("Durable demo storage operation failed");
   }
-  if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  // Writes ask for `Prefer: return=minimal`, which PostgREST answers with 201 and an empty
+  // body rather than 204, so status alone is not a reliable test for "nothing to parse".
+  // Reading the body first and only parsing when it is non-empty covers both, and stops a
+  // successful insert from surfacing as a JSON syntax error.
+  const text = await response.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export type StoredQuote = {
