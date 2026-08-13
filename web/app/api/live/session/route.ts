@@ -196,7 +196,10 @@ export async function POST(request: NextRequest) {
           chainId: 968,
           jobId: created.jobId.toString(),
           sellerKey: seller.key,
-          endpoint: seller.endpoint,
+          // The service being bought, not a URL. These archetypes are served in-process
+          // rather than over HTTP, and naming a path here would put a claim in the on-chain
+          // commitment that no request was ever made against.
+          service: seller.service,
           infrastructureFailure,
           delivery,
         };

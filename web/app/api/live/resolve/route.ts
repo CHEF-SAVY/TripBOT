@@ -24,7 +24,7 @@ const evidenceSchema = z.object({
   chainId: z.literal(968),
   jobId: z.string().regex(/^\d+$/),
   sellerKey: z.enum(["honest", "faulty", "absent"]),
-  endpoint: z.string(),
+  service: z.string(),
   infrastructureFailure: z.boolean(),
   delivery: deliverySchema,
 }).strict();

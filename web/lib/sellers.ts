@@ -11,7 +11,6 @@ type SellerDefinition = {
   archetype: SellerArchetype;
   agentIdEnv: string;
   fallbackAgentId?: bigint;
-  endpoint: string;
   priceBot: string;
   service: string;
   description: string;
@@ -24,7 +23,6 @@ const definitions: SellerDefinition[] = [
     archetype: "honest",
     agentIdEnv: "SELLER_HONEST_AGENT_ID",
     fallbackAgentId: 0n,
-    endpoint: "/api/premium/dataset",
     priceBot: "0.010000",
     service: "Market pulse dataset",
     description: "Returns a complete, schema-valid market snapshot.",
@@ -34,7 +32,6 @@ const definitions: SellerDefinition[] = [
     name: "Drift Research Agent",
     archetype: "faulty",
     agentIdEnv: "SELLER_FAULTY_AGENT_ID",
-    endpoint: "/api/premium/agent-task",
     priceBot: "0.030000",
     service: "Research synthesis",
     description: "Returns a visibly malformed result that the buyer can dispute.",
@@ -44,7 +41,6 @@ const definitions: SellerDefinition[] = [
     name: "Null Signal Agent",
     archetype: "absent",
     agentIdEnv: "SELLER_ABSENT_AGENT_ID",
-    endpoint: "/api/premium/quote",
     priceBot: "0.005000",
     service: "Signal quote",
     description: "Accepts a job but fails to deliver a usable response.",

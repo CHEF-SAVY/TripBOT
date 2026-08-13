@@ -7,12 +7,15 @@ type Seller = {
   name: string;
   archetype: "honest" | "faulty" | "absent";
   agentId: string | null;
-  endpoint: string;
   priceBot: string;
   service: string;
   description: string;
   configured: boolean;
   bond: { gross: string; reserved: string; free: string } | null;
+  /// Collateral the escrow would reserve for this specific job, derived on the server from
+  /// the chain's current bond ratio — this is what the buyer actually recovers on a slash.
+  atRiskBot: string;
+  atRiskCovered: boolean;
 };
 
 type Job = {
@@ -337,7 +340,23 @@ export function BuyerSession() {
                   <button className={`seller-card glass ${selected === seller.key ? "selected" : ""}`} key={seller.key} onClick={() => { if (!busy && !quote) setSelected(seller.key); }} disabled={!seller.configured || busy || Boolean(quote)}>
                     <div className="seller-top"><span className={`agent-orb ${seller.archetype}`} /><span>AGENT #{seller.agentId ?? "—"}</span></div>
                     <h3>{seller.name}</h3><p>{seller.description}</p>
-                    <div className="seller-meta"><strong>{seller.priceBot} BOT</strong><span>{seller.bond ? `${seller.bond.free} BOT bond free` : "awaiting registration"}</span></div>
+                    <div className="seller-meta"><strong>{seller.priceBot} BOT</strong><span>{seller.service}</span></div>
+                    {seller.bond ? (
+                      <div className="seller-collateral">
+                        <div className="collateral-risk">
+                          <span>You recover if they fail</span>
+                          <b>{seller.priceBot} + {seller.atRiskBot} BOT</b>
+                        </div>
+                        <div className="collateral-split">
+                          <i><span>posted</span><b>{seller.bond.gross}</b></i>
+                          <i><span>reserved</span><b>{seller.bond.reserved}</b></i>
+                          <i><span>free</span><b>{seller.bond.free}</b></i>
+                        </div>
+                        {!seller.atRiskCovered && <p className="collateral-warn">Not enough free collateral for this job right now.</p>}
+                      </div>
+                    ) : (
+                      <div className="seller-collateral"><p className="collateral-warn">Awaiting registration — no collateral posted.</p></div>
+                    )}
                   </button>
                 )) ?? <div className="skeleton-card">Reading seller bonds…</div>}
               </div>

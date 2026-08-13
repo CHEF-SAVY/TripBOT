@@ -1,4 +1,6 @@
 import { NextResponse } from "next/server";
+import { jobEscrowAbi } from "@/lib/abi/job-escrow";
+import { bot, envAddress, publicClient } from "@/lib/chain";
 import { readBond } from "@/lib/jobs";
 import { getSellers } from "@/lib/sellers";
 
@@ -6,15 +8,26 @@ export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
+    // The bond ratio is an owner-settable risk parameter, so the amount a buyer stands to
+    // recover is derived from the chain rather than assumed, using the same round-up the
+    // escrow applies when it reserves collateral.
+    const ratio = await publicClient.readContract({
+      address: envAddress("JOB_ESCROW_ADDRESS"),
+      abi: jobEscrowAbi,
+      functionName: "minBondRatioBps",
+    });
+
     const sellers = await Promise.all(
       getSellers().map(async (seller) => {
         const bond = seller.agentId === null ? null : await readBond(seller.agentId);
+        const atRiskWei = (seller.priceWei * ratio + 9_999n) / 10_000n;
         return {
+          atRiskBot: bot(atRiskWei),
+          atRiskCovered: bond ? bond.free >= atRiskWei : false,
           key: seller.key,
           name: seller.name,
           archetype: seller.archetype,
           agentId: seller.agentId?.toString() ?? null,
-          endpoint: seller.endpoint,
           priceBot: seller.priceBot,
           service: seller.service,
           description: seller.description,
