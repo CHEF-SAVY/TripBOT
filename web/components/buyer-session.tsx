@@ -38,6 +38,17 @@ type LiveState = {
   updatedAt: string;
 };
 
+/// Rendered from the escrow's own responseWindow rather than a constant, because it is an
+/// owner-settable risk parameter: printing a hardcoded figure would misstate how long the
+/// buyer actually has to release or dispute the moment anyone changes it on-chain.
+function formatWindow(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3_600) return `${Math.round(seconds / 60)}m`;
+  if (seconds % 86_400 === 0) return `${seconds / 86_400}d`;
+  return `${Math.round(seconds / 3_600)}h`;
+}
+
 type Payments = {
   refundBot: string;
   slashedBondBot: string;
@@ -348,7 +359,7 @@ export function BuyerSession() {
 
           {delivery?.delivery && (
             <div className="delivery-inspector">
-              <div className="delivery-banner"><div><p className="section-kicker">JOB #{events.find((item) => item.type === "funded")?.jobId ?? "—"} · HASH-ONLY EVIDENCE</p><h3>{delivery.delivery.ok ? "Seller returned a payload" : "No usable delivery arrived"}</h3></div><span className={`status-chip ${delivery.delivery.ok && !delivery.delivery.faults.length ? "ok" : "pending"}`}>HTTP {delivery.delivery.status}</span></div>
+              <div className="delivery-banner"><div><p className="section-kicker">JOB #{events.find((item) => item.type === "funded")?.jobId ?? "—"} · {(delivery.evidenceMode ?? "hash-only").toUpperCase()} EVIDENCE</p><h3>{delivery.delivery.ok ? "Seller returned a payload" : "No usable delivery arrived"}</h3></div><span className={`status-chip ${delivery.delivery.ok && !delivery.delivery.faults.length ? "ok" : "pending"}`}>HTTP {delivery.delivery.status}</span></div>
               <div className="evidence-hash"><span>EVIDENCE COMMITMENT</span><code>{delivery.evidenceHash}</code></div>
               <pre>{JSON.stringify(delivery.delivery.payload, null, 2)}</pre>
               {delivery.delivery.faults.length > 0 && <div className="fault-list"><strong>Detected evidence flags</strong>{delivery.delivery.faults.map((fault) => <span key={fault}>× {fault}</span>)}</div>}
@@ -398,7 +409,7 @@ export function BuyerSession() {
 
         <aside className="proof-rail">
           <div className="rail-title"><span className="live-dot" /><span>ON-CHAIN PROOF</span></div>
-          <div className="stat-grid"><div><span>Jobs</span><strong>{state.data?.totalJobs ?? "—"}</strong></div><div><span>Escrowed</span><strong>{state.data?.escrowedBot ?? "—"} BOT</strong></div><div><span>Bond rule</span><strong>{state.data?.bondRatioPercent ?? "—"}%</strong></div><div><span>Disputed</span><strong>{state.data?.disputedJobs ?? "—"}</strong></div></div>
+          <div className="stat-grid"><div><span>Jobs</span><strong>{state.data?.totalJobs ?? "—"}</strong></div><div><span>Escrowed</span><strong>{state.data?.escrowedBot ?? "—"} BOT</strong></div><div><span>Bond rule</span><strong>{state.data?.bondRatioPercent ?? "—"}%</strong></div><div><span>Disputed</span><strong>{state.data?.disputedJobs ?? "—"}</strong></div><div><span>Response window</span><strong>{state.data ? formatWindow(state.data.responseWindowSeconds) : "—"}</strong></div><div><span>ERC-8004 proof</span><strong>{state.data ? (state.data.validationRegistryEnabled ? "on" : "off") : "—"}</strong></div></div>
           <div className="proof-list">
             <div className="proof-list-head"><span>Recent settlement proofs</span><span>LIVE</span></div>
             {jobs.data?.jobs.map((job) => <article className="proof-row" key={job.id}><div><strong>JOB {job.id.padStart(2, "0")}</strong><span className={`job-status ${job.statusLabel.toLowerCase().replace(" ", "-")}`}>{job.statusLabel}</span></div><p>{job.amountBot} BOT · agent #{job.sellerAgentId}</p><div className="proof-links">{Object.entries(job.proofs).map(([kind, hash]) => <a key={kind} href={`${explorer}/tx/${hash}`} target="_blank" rel="noreferrer">{kind} ↗</a>)}</div></article>) ?? <div className="skeleton-card">Reading transaction receipts…</div>}
