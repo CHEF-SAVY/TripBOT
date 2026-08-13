@@ -32,7 +32,7 @@ export function walletFor(role: WalletRole) {
   return createWalletClient({
     account: accountFor(role),
     chain: botTestnet,
-    transport: http(botTestnet.rpcUrls.default.http[0], { retryCount: 1, timeout: 10_000 }),
+    transport: http(botTestnet.rpcUrls.default.http[0], { retryCount: 1, timeout: 30_000 }),
   });
 }
 

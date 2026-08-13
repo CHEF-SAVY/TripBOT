@@ -24,7 +24,11 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
       "content-type": "application/json",
       ...init.headers,
     },
-    signal: AbortSignal.timeout(8_000),
+    // Generous enough to absorb a cold connection and a PostgREST schema-cache reload,
+    // both of which land on the first visitor after a deploy and were measured at 6-15s.
+    // Still far below the routes' maxDuration, so a genuinely hung call fails the request
+    // rather than the whole function invocation.
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) {
     const body = (await response.text()).slice(0, 500);
