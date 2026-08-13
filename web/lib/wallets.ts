@@ -1,9 +1,9 @@
 import "server-only";
 
 import { randomUUID } from "node:crypto";
-import { createWalletClient, http, type Address, type Hex } from "viem";
+import { createWalletClient, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { botTestnet } from "./chain";
+import { botTestnet, botTransport } from "./chain";
 import { claimSignerLease, releaseSignerLease } from "./storage";
 
 export type WalletRole = "buyer" | "seller" | "arbiter";
@@ -32,7 +32,9 @@ export function walletFor(role: WalletRole) {
   return createWalletClient({
     account: accountFor(role),
     chain: botTestnet,
-    transport: http(botTestnet.rpcUrls.default.http[0], { retryCount: 1, timeout: 30_000 }),
+    // Same pooled, keep-alive connection the reads use; a write should not pay a fresh
+    // handshake at the exact moment a visitor is waiting on a transaction.
+    transport: botTransport,
   });
 }
 
