@@ -21,26 +21,28 @@ body {
   margin: 0;
   min-height: 100vh;
   font-family: var(--font-sans);
+  /* Order is top-to-bottom: the checkered grid rides over the starfield, which sits on the
+     black. Small stars at mixed brightness, tiled at sizes that share no common factor so
+     the repeat never resolves into a visible pattern. */
   background:
-    radial-gradient(circle at 72% 12%, rgba(169, 244, 238, 0.07), transparent 26rem),
-    radial-gradient(circle at 18% 42%, rgba(255, 255, 255, 0.035), transparent 23rem),
     linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px),
+    radial-gradient(1.4px 1.4px at 37px 61px, rgba(255,255,255,.75), transparent 100%),
+    radial-gradient(1px 1px at 173px 29px, rgba(255,255,255,.4), transparent 100%),
+    radial-gradient(1.6px 1.6px at 299px 211px, rgba(169,244,238,.6), transparent 100%),
+    radial-gradient(0.9px 0.9px at 91px 257px, rgba(255,255,255,.3), transparent 100%),
+    radial-gradient(1.2px 1.2px at 251px 119px, rgba(255,255,255,.5), transparent 100%),
+    radial-gradient(0.8px 0.8px at 419px 341px, rgba(169,244,238,.32), transparent 100%),
+    radial-gradient(1.1px 1.1px at 517px 143px, rgba(255,255,255,.45), transparent 100%),
+    radial-gradient(0.9px 0.9px at 61px 433px, rgba(255,255,255,.26), transparent 100%),
     var(--black);
-  background-size: auto, auto, 40px 40px, 40px 40px, auto;
+  background-size:
+    40px 40px, 40px 40px,
+    431px 431px, 373px 373px, 563px 563px, 317px 317px,
+    487px 487px, 619px 619px, 691px 691px, 547px 547px,
+    auto;
   position: relative;
 }
-body::before { content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .9;
-  background-image:
-    radial-gradient(1.6px 1.6px at 40px 70px, rgba(255,255,255,.55), transparent 100%),
-    radial-gradient(1px 1px at 180px 30px, rgba(255,255,255,.34), transparent 100%),
-    radial-gradient(1.9px 1.9px at 300px 210px, rgba(169,244,238,.42), transparent 100%),
-    radial-gradient(1px 1px at 90px 260px, rgba(255,255,255,.28), transparent 100%),
-    radial-gradient(1.3px 1.3px at 250px 120px, rgba(255,255,255,.4), transparent 100%),
-    radial-gradient(1px 1px at 420px 340px, rgba(169,244,238,.26), transparent 100%);
-  background-size: 430px 430px, 370px 370px, 560px 560px, 320px 320px, 480px 480px, 620px 620px; }
-body::after { content: ""; position: fixed; inset: 0; z-index: -2; pointer-events: none;
-  background: radial-gradient(ellipse at 50% 0%, rgba(169,244,238,.05), transparent 60%); }
 
 a { color: inherit; text-decoration: none; }
 button, input { font: inherit; }
@@ -145,7 +147,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--lime); outline-
 .solution-map article:hover { padding-left: 20px; transform: translateX(8px); background: linear-gradient(90deg, rgba(169,244,238,.05), transparent 66%); }.solution-map article:hover::before { background: var(--cyan); box-shadow: 0 0 18px rgba(169,244,238,.6); transform: translateY(-50%) scale(1.5); }
 .solution-map article > span { color: var(--cyan); font: 9px monospace; letter-spacing: .14em; }.solution-map strong { font-size: 21px; }.solution-map p { margin: 6px 0 0; color: var(--muted); line-height: 1.55; font-size: 13px; }.solution-map i { position: absolute; right: 12px; color: rgba(255,255,255,.06); font: 800 68px monospace; font-style: normal; }
 
-.journey { position: relative; padding: 76px 0 84px; overflow: hidden; background: linear-gradient(110deg, rgba(255,255,255,.018), transparent 38%, rgba(169,244,238,.025)); }
+.journey { position: relative; padding: 76px 0 84px; overflow: hidden;  }
 .journey::before { content: "04"; position: absolute; right: 3%; top: 18%; color: rgba(255,255,255,.025); font: 900 clamp(180px, 28vw, 380px)/.8 var(--font-sans); letter-spacing: -.15em; pointer-events: none; }
 .section-intro { display: grid; grid-template-columns: 1fr .6fr; column-gap: 48px; align-items: end; }
 .section-intro > div { grid-column: 1 / -1; }
