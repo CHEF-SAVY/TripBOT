@@ -24,15 +24,24 @@ async function request<T>(path: string, init: RequestInit): Promise<T> {
       "content-type": "application/json",
       ...init.headers,
     },
-    signal: AbortSignal.timeout(8_000),
+    // Generous enough to absorb a cold connection and a PostgREST schema-cache reload,
+    // both of which land on the first visitor after a deploy and were measured at 6-15s.
+    // Still far below the routes' maxDuration, so a genuinely hung call fails the request
+    // rather than the whole function invocation.
+    signal: AbortSignal.timeout(15_000),
   });
   if (!response.ok) {
     const body = (await response.text()).slice(0, 500);
     console.error("Demo storage request failed", response.status, body);
     throw new Error("Durable demo storage operation failed");
   }
-  if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
+  // Writes ask for `Prefer: return=minimal`, which PostgREST answers with 201 and an empty
+  // body rather than 204, so status alone is not a reliable test for "nothing to parse".
+  // Reading the body first and only parsing when it is non-empty covers both, and stops a
+  // successful insert from surfacing as a JSON syntax error.
+  const text = await response.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }
 
 export type StoredQuote = {
@@ -133,6 +142,20 @@ export async function claimResolution(id: string, visitorHash: string, ipHash: s
   return request<boolean>("rpc/claim_demo_resolution", {
     method: "POST",
     body: JSON.stringify({ p_id: id, p_visitor_hash: visitorHash, p_ip_hash: ipHash }),
+  });
+}
+
+export async function claimSignerLease(role: string, holder: string, ttlSeconds: number): Promise<boolean> {
+  return request<boolean>("rpc/claim_signer_lease", {
+    method: "POST",
+    body: JSON.stringify({ p_role: role, p_holder: holder, p_ttl_seconds: ttlSeconds }),
+  });
+}
+
+export async function releaseSignerLease(role: string, holder: string): Promise<boolean> {
+  return request<boolean>("rpc/release_signer_lease", {
+    method: "POST",
+    body: JSON.stringify({ p_role: role, p_holder: holder }),
   });
 }
 

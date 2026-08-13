@@ -38,6 +38,26 @@ type LiveState = {
   updatedAt: string;
 };
 
+/// Rendered from the escrow's own responseWindow rather than a constant, because it is an
+/// owner-settable risk parameter: printing a hardcoded figure would misstate how long the
+/// buyer actually has to release or dispute the moment anyone changes it on-chain.
+function formatWindow(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "—";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3_600) return `${Math.round(seconds / 60)}m`;
+  if (seconds % 86_400 === 0) return `${seconds / 86_400}d`;
+  return `${Math.round(seconds / 3_600)}h`;
+}
+
+type Payments = {
+  refundBot: string;
+  slashedBondBot: string;
+  totalBot: string;
+  bondBeforeBot: string;
+  bondAfterBot: string;
+  paidTo: "buyer" | "seller";
+};
+
 type DemoEvent = {
   type: string;
   message: string;
@@ -144,7 +164,8 @@ export function BuyerSession() {
   const [delivery, setDelivery] = useState<DemoEvent>();
   const [sessionToken, setSessionToken] = useState<string>();
   const [verdict, setVerdict] = useState<Verdict>();
-  const [resolved, setResolved] = useState<{ message: string; txHash: string; outcome: string }>();
+  const [resolved, setResolved] = useState<{ message: string; txHash: string; outcome: string; payments?: Payments }>();
+  const [stagedPayment, setStagedPayment] = useState<"none" | "refund" | "slash" | "total">("none");
 
   const selectedSeller = useMemo(
     () => sellers.data?.sellers.find((seller) => seller.key === selected),
@@ -203,6 +224,7 @@ export function BuyerSession() {
     setSessionToken(undefined);
     setVerdict(undefined);
     setResolved(undefined);
+    setStagedPayment("none");
     try {
       await readEventStream({ action: "start", sellerKey: selected }, record);
     } catch (reason) {
@@ -251,10 +273,25 @@ export function BuyerSession() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ sessionToken }),
       });
-      const body = await response.json() as { message?: string; txHash?: string; outcome?: string; error?: string };
+      const body = await response.json() as { message?: string; txHash?: string; outcome?: string; payments?: Payments; error?: string };
       if (!response.ok || !body.message || !body.txHash || !body.outcome) throw new Error(body.error || "The evidence ruling stopped safely.");
-      setResolved({ message: body.message, txHash: body.txHash, outcome: body.outcome });
+      setResolved({ message: body.message, txHash: body.txHash, outcome: body.outcome, payments: body.payments });
       setEvents((current) => [...current, { type: "resolved", message: body.message as string, txHash: body.txHash }]);
+
+      // The buyer is compensated by two separate movements from two different contracts.
+      // Revealing them a beat apart is what makes that legible; collapsing them into one
+      // number is exactly the thing this product argues against. Reduced-motion users get
+      // the completed ledger immediately rather than a staged one.
+      if (body.payments && body.outcome === "seller-at-fault") {
+        const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        setStagedPayment(reduced ? "total" : "refund");
+        if (!reduced) {
+          window.setTimeout(() => setStagedPayment("slash"), 600);
+          window.setTimeout(() => setStagedPayment("total"), 1_200);
+        }
+      } else {
+        setStagedPayment("total");
+      }
       await Promise.all([state.retry(), jobs.retry(), sellers.retry()]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The evidence ruling stopped safely.");
@@ -322,7 +359,7 @@ export function BuyerSession() {
 
           {delivery?.delivery && (
             <div className="delivery-inspector">
-              <div className="delivery-banner"><div><p className="section-kicker">JOB #{events.find((item) => item.type === "funded")?.jobId ?? "—"} · HASH-ONLY EVIDENCE</p><h3>{delivery.delivery.ok ? "Seller returned a payload" : "No usable delivery arrived"}</h3></div><span className={`status-chip ${delivery.delivery.ok && !delivery.delivery.faults.length ? "ok" : "pending"}`}>HTTP {delivery.delivery.status}</span></div>
+              <div className="delivery-banner"><div><p className="section-kicker">JOB #{events.find((item) => item.type === "funded")?.jobId ?? "—"} · {(delivery.evidenceMode ?? "hash-only").toUpperCase()} EVIDENCE</p><h3>{delivery.delivery.ok ? "Seller returned a payload" : "No usable delivery arrived"}</h3></div><span className={`status-chip ${delivery.delivery.ok && !delivery.delivery.faults.length ? "ok" : "pending"}`}>HTTP {delivery.delivery.status}</span></div>
               <div className="evidence-hash"><span>EVIDENCE COMMITMENT</span><code>{delivery.evidenceHash}</code></div>
               <pre>{JSON.stringify(delivery.delivery.payload, null, 2)}</pre>
               {delivery.delivery.faults.length > 0 && <div className="fault-list"><strong>Detected evidence flags</strong>{delivery.delivery.faults.map((fault) => <span key={fault}>× {fault}</span>)}</div>}
@@ -331,7 +368,33 @@ export function BuyerSession() {
               ) : verdict === "dispute" && !resolved ? (
                 <div className="resolution-gate"><div><p className="section-kicker">ESCROW + BOND REMAIN LOCKED</p><h3>Request the evidence ruling</h3><p>The arbiter recomputes the stored evidence commitment before choosing seller fault, seller prevails, or neutral infrastructure failure.</p></div><button className="button primary" disabled={busy} onClick={() => void resolve()}>{busy ? "Ruling on-chain…" : "Resolve from evidence →"}</button></div>
               ) : (
-                <div className="final-outcome"><span>FINAL ON-CHAIN OUTCOME</span><h3>{resolved?.outcome.replaceAll("-", " ") ?? "seller paid"}</h3><p>{resolved?.message ?? "Buyer accepted the delivery. Escrow paid the seller and released the reserved bond."}</p></div>
+                <div className="final-outcome">
+                  <span>FINAL ON-CHAIN OUTCOME</span>
+                  <h3>{resolved?.outcome === "seller-at-fault" ? "the buyer was paid twice" : resolved?.outcome.replaceAll("-", " ") ?? "seller paid"}</h3>
+                  <p>{resolved?.message ?? "Buyer accepted the delivery. Escrow paid the seller and released the reserved bond."}</p>
+                  {resolved?.payments && resolved.payments.paidTo === "buyer" && (
+                    <div className="payment-stage" aria-live="polite">
+                      <div className={stagedPayment !== "none" ? "landed" : ""}>
+                        <span>Escrow refund</span>
+                        <b>+{resolved.payments.refundBot} BOT</b>
+                      </div>
+                      {resolved.outcome === "seller-at-fault" && (
+                        <div className={stagedPayment === "slash" || stagedPayment === "total" ? "landed alarm" : ""}>
+                          <span>Slashed bond</span>
+                          <b>{stagedPayment === "slash" || stagedPayment === "total" ? `+${resolved.payments.slashedBondBot} BOT` : "waiting…"}</b>
+                        </div>
+                      )}
+                      <div className={stagedPayment === "total" ? "landed total" : ""}>
+                        <span>Total to buyer</span>
+                        <b>{stagedPayment === "total" ? `+${resolved.payments.totalBot} BOT` : "—"}</b>
+                      </div>
+                      <p>Seller gross bond: {resolved.payments.bondBeforeBot} → {resolved.payments.bondAfterBot} BOT</p>
+                    </div>
+                  )}
+                  {resolved?.outcome === "seller-at-fault" && stagedPayment === "total" && (
+                    <p className="outcome-copy">The seller paid for failing, out of their own stake. That is the tripwire.</p>
+                  )}
+                </div>
               )}
             </div>
           )}
@@ -346,7 +409,7 @@ export function BuyerSession() {
 
         <aside className="proof-rail">
           <div className="rail-title"><span className="live-dot" /><span>ON-CHAIN PROOF</span></div>
-          <div className="stat-grid"><div><span>Jobs</span><strong>{state.data?.totalJobs ?? "—"}</strong></div><div><span>Escrowed</span><strong>{state.data?.escrowedBot ?? "—"} BOT</strong></div><div><span>Bond rule</span><strong>{state.data?.bondRatioPercent ?? "—"}%</strong></div><div><span>Disputed</span><strong>{state.data?.disputedJobs ?? "—"}</strong></div></div>
+          <div className="stat-grid"><div><span>Jobs</span><strong>{state.data?.totalJobs ?? "—"}</strong></div><div><span>Escrowed</span><strong>{state.data?.escrowedBot ?? "—"} BOT</strong></div><div><span>Bond rule</span><strong>{state.data?.bondRatioPercent ?? "—"}%</strong></div><div><span>Disputed</span><strong>{state.data?.disputedJobs ?? "—"}</strong></div><div><span>Response window</span><strong>{state.data ? formatWindow(state.data.responseWindowSeconds) : "—"}</strong></div><div><span>ERC-8004 proof</span><strong>{state.data ? (state.data.validationRegistryEnabled ? "on" : "off") : "—"}</strong></div></div>
           <div className="proof-list">
             <div className="proof-list-head"><span>Recent settlement proofs</span><span>LIVE</span></div>
             {jobs.data?.jobs.map((job) => <article className="proof-row" key={job.id}><div><strong>JOB {job.id.padStart(2, "0")}</strong><span className={`job-status ${job.statusLabel.toLowerCase().replace(" ", "-")}`}>{job.statusLabel}</span></div><p>{job.amountBot} BOT · agent #{job.sellerAgentId}</p><div className="proof-links">{Object.entries(job.proofs).map(([kind, hash]) => <a key={kind} href={`${explorer}/tx/${hash}`} target="_blank" rel="noreferrer">{kind} ↗</a>)}</div></article>) ?? <div className="skeleton-card">Reading transaction receipts…</div>}

@@ -14,7 +14,10 @@ export const botTestnet = defineChain({
 
 export const publicClient = createPublicClient({
   chain: botTestnet,
-  transport: http(botTestnet.rpcUrls.default.http[0], { retryCount: 2, timeout: 10_000 }),
+  // BOT Chain testnet is young and its public RPC has been observed taking well over ten
+  // seconds to answer a single call. Timing out below that turns a slow chain into a failed
+  // read, which the interface then has to explain as an error rather than as latency.
+  transport: http(botTestnet.rpcUrls.default.http[0], { retryCount: 2, timeout: 30_000 }),
 });
 
 const defaults: Record<string, Address> = {

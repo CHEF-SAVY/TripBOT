@@ -1,8 +1,10 @@
 import "server-only";
 
+import { randomUUID } from "node:crypto";
 import { createWalletClient, http, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { botTestnet } from "./chain";
+import { claimSignerLease, releaseSignerLease } from "./storage";
 
 export type WalletRole = "buyer" | "seller" | "arbiter";
 
@@ -30,10 +32,23 @@ export function walletFor(role: WalletRole) {
   return createWalletClient({
     account: accountFor(role),
     chain: botTestnet,
-    transport: http(botTestnet.rpcUrls.default.http[0], { retryCount: 1, timeout: 10_000 }),
+    transport: http(botTestnet.rpcUrls.default.http[0], { retryCount: 1, timeout: 30_000 }),
   });
 }
 
+// Longer than the routes' maxDuration, so a lease always outlives the request that took
+// it, and shorter than any human retry, so a crashed instance frees the role quickly.
+const LEASE_TTL_SECONDS = 90;
+const LEASE_WAIT_MS = 20_000;
+const LEASE_POLL_MS = 500;
+
+/// Serializes every transaction sent by one role.
+///
+/// Nonce ordering has to hold across instances, not just within one: a serverless
+/// deployment can route two concurrent sessions to separate instances, where both read the
+/// same pending nonce and one transaction is then dropped or replaced. The durable lease is
+/// therefore the real lock. The in-process chain below it is only an optimization — it stops
+/// one instance from racing itself into the database for a lease it already holds.
 export async function withSignerLock<T>(role: WalletRole, action: () => Promise<T>): Promise<T> {
   const previous = tails.get(role) ?? Promise.resolve();
   let release!: () => void;
@@ -43,8 +58,26 @@ export async function withSignerLock<T>(role: WalletRole, action: () => Promise<
   const tail = previous.catch(() => undefined).then(() => current);
   tails.set(role, tail);
   await previous.catch(() => undefined);
+
+  const holder = randomUUID();
   try {
-    return await action();
+    const deadline = Date.now() + LEASE_WAIT_MS;
+    let held = false;
+    while (!held) {
+      held = await claimSignerLease(role, holder, LEASE_TTL_SECONDS);
+      if (held) break;
+      if (Date.now() >= deadline) {
+        throw new Error("Another live session is using this signer. Try again in a moment.");
+      }
+      await new Promise((resolve) => setTimeout(resolve, LEASE_POLL_MS));
+    }
+    try {
+      return await action();
+    } finally {
+      // A failed release is survivable: the lease expires on its own. Never let it mask
+      // the outcome of the action itself.
+      await releaseSignerLease(role, holder).catch(() => undefined);
+    }
   } finally {
     release();
     if (tails.get(role) === tail) tails.delete(role);
