@@ -51,12 +51,13 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--lime); outline-
 .shell { width: min(1220px, calc(100% - 72px)); margin-inline: auto; }
 .shell-wide { width: min(1360px, calc(100% - 72px)); margin-inline: auto; }
 
-.floating-brand { position: fixed; left: 24px; top: 22px; z-index: 30; display: inline-flex; gap: 9px; align-items: center; color: var(--ink); font-size: 11px; font-weight: 800; letter-spacing: .16em; mix-blend-mode: screen; }
-.brand-mark { display: grid; place-items: center; width: 26px; height: 26px; border: 1px solid var(--cyan); color: #070707; background: var(--cyan); box-shadow: 0 0 22px rgba(169,244,238,.16); }
+.floating-brand { position: fixed; left: 22px; top: 18px; z-index: 30; display: inline-flex; gap: 9px; align-items: center; padding: 7px 14px 7px 8px; border: 1px solid rgba(255,255,255,.09); border-radius: 999px; background: rgba(8,11,10,.82); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); color: var(--ink); font-size: 10px; font-weight: 700; letter-spacing: .16em; transition: border-color .2s ease; }
+.floating-brand:hover { border-color: rgba(169,244,238,.35); }
+.brand-mark { width: 22px; height: 22px; color: var(--cyan); flex: none; }
 
 .glass { border: 1px solid rgba(255,255,255,.14); background: linear-gradient(135deg, rgba(255,255,255,.075), rgba(255,255,255,.018)); box-shadow: inset 0 1px 0 rgba(255,255,255,.06), 0 24px 70px rgba(0,0,0,.24); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
 
-.hero { min-height: 460px; display: grid; grid-template-columns: minmax(0, 800px); align-items: center; padding: 76px 0 84px; }
+.hero { min-height: 300px; display: grid; grid-template-columns: minmax(0, 800px); align-items: center; padding: 132px 0 12px; }
 .hero-copy-wrap { position: relative; z-index: 2; max-width: 800px; }
 .eyebrow { color: var(--lime); font-size: 11px; font-weight: 700; letter-spacing: .18em; }
 .section-kicker { color: rgba(242,243,241,.72); font-size: 11px; font-weight: 700; letter-spacing: .18em; }
@@ -461,3 +462,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--lime); outline-
 .lp-head h1 { margin: 0; max-width: 20ch; font-size: clamp(30px, 4.6vw, 52px); line-height: 1.04;
   letter-spacing: -.035em; font-weight: 700; }
 .lp-head p:last-child { margin: 0; max-width: 62ch; color: var(--muted); font-size: 14px; line-height: 1.65; }
+
+/* The entry points and the chain facts, moved out of the hero so the first screen carries
+   only the name and what it does. */
+.hero-follow { padding: 0 0 84px; display: grid; gap: 34px; }

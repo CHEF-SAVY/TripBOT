@@ -14,15 +14,21 @@ export default function Home() {
             A buyer-first settlement protocol for autonomous work. BOT waits in escrow, seller collateral
             stays reserved, and every outcome leaves a chain-verifiable receipt.
           </p>
-          <div className="hero-actions hero-enter enter-4">
-            <Link className="button primary" href="/live">Take the buyer&apos;s seat <span>↗</span></Link>
-            <a className="button ghost" href="https://scan.bohr.life/address/0x627853Ddf094172913f23366839A86DF3d1Aa5bB" target="_blank" rel="noreferrer">Inspect live proof</a>
-          </div>
-          <div className="hero-stats hero-enter enter-5">
-            <div><strong>968</strong><span>TESTNET CHAIN ID</span></div>
-            <div><strong>20%</strong><span>DEFAULT BOND RULE</span></div>
-            <div><strong>1:1</strong><span>JOB TO RECEIPT</span></div>
-          </div>
+        </div>
+      </section>
+
+      {/* The entry points sit below the name rather than inside it, so the first thing on the
+          page is only what the product is called and what it does. */}
+      <section className="hero-follow shell">
+        <div className="hero-actions hero-enter enter-4">
+          <Link className="button primary" href="/live">Take the buyer&apos;s seat <span>↗</span></Link>
+          <a className="button ghost" href="https://scan.bohr.life/address/0xe02695454edA18Ec0b00836F98635aC2D6CAA238" target="_blank" rel="noreferrer">Inspect live proof</a>
+        </div>
+        <div className="hero-stats hero-enter enter-5">
+          <div><strong>677</strong><span>MAINNET CHAIN ID</span></div>
+          <div><strong>968</strong><span>TESTNET CHAIN ID</span></div>
+          <div><strong>20%</strong><span>DEFAULT BOND RULE</span></div>
+          <div><strong>1:1</strong><span>JOB TO RECEIPT</span></div>
         </div>
       </section>
       <section className="problem-section shell" aria-labelledby="problem-title">
