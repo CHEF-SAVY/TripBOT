@@ -111,6 +111,24 @@ buyer nor an absent arbiter can strand funds.
 | IdentityRegistry | `0x66677c64d0545a5F161EAE83fed8D260EAc58cAa` |
 | ValidationRegistry | `0x4Dd733cBAcF4A13bD265CCB17B026BD9CdDBb0B0` |
 
+### All three settlement paths, proven on mainnet
+
+The mainnet contracts are not merely deployed — every exit has been exercised against them
+with real BOT. One agent, registered and bonded at 0.05 BOT, then three jobs:
+
+| Path | Job | Outcome | Transaction |
+|---|---|---|---|
+| Buyer releases | #0 | seller paid in full | `0xf7f77cfbbd153716bfc245e02b215cd5f1e47730c4b4a4d58d5f4c0d84080231` |
+| Buyer disputes, seller at fault | #1 | buyer refunded **and** collateral slashed, 0.050 → 0.048 BOT | `0xe9367a77c4b4993786852cb9e400082ec3a3c57e033bd36701c8708b3fbfd6b7` |
+| Buyer never responds | #2 | timeout auto-released to the seller | `0x42b774d22f1b05588a791a2af62516e05a6221ede9fb15be11705715a6f966c7` |
+
+Each job was preceded by a real ERC-8004 validation request and a `createJob` carrying native
+BOT. The slash in job #1 is the whole argument in one transaction: the buyer received the
+escrow refund *and* the seller's own stake.
+
+The response window was briefly lowered to 60 seconds to make the timeout path observable,
+then restored to 48 hours.
+
 **The funded judge session runs on testnet, deliberately.** The mainnet contracts hold no
 demo funds and no visitor-facing path can move value on 677. A public demo that spends from a
 server-held wallet is the right shape for testnet play money and the wrong shape for real
@@ -126,9 +144,12 @@ is the one in the second table.
 
 ## Status
 
-- Contracts complete, 138 unit tests passing, `forge fmt --check` clean.
-- Full lifecycle verified on-chain, not only in tests: quote, escrow funding, delivery,
-  dispute, and an arbiter ruling that slashed real collateral to the buyer.
+- Contracts complete: 168 tests passing — 136 unit, 24 adversarial attacks attempting real
+  theft, and 5 invariants over randomised call sequences. `forge fmt --check` clean.
+- All three settlement paths exercised on **mainnet** with real BOT: release, dispute with a
+  real collateral slash, and timeout auto-release. Transaction hashes above.
+- Full funded session verified on testnet through the web app: quote, escrow funding,
+  delivery, dispute, and an arbiter ruling that slashed collateral to the buyer.
 - Web app complete: read APIs, funded buyer session, arbiter resolution.
 - Contracts deployed and wiring-verified on mainnet (677) and testnet (968).
 
