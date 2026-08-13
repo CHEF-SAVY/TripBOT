@@ -30,9 +30,6 @@ export function assertDemoWriteReady(): void {
   if (!process.env.SESSION_SECRET || Buffer.byteLength(process.env.SESSION_SECRET) < 32) {
     throw new Error("SESSION_SECRET must contain at least 32 bytes");
   }
-  if (!process.env.DEMO_ACCESS_CODE || Buffer.byteLength(process.env.DEMO_ACCESS_CODE) < 16) {
-    throw new Error("DEMO_ACCESS_CODE must contain at least 16 bytes");
-  }
   if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("Durable demo storage is not configured");
   }

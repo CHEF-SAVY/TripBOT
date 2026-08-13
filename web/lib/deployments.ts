@@ -11,8 +11,16 @@ export const BOT_TESTNET_DEPLOYMENT = {
   validationRegistry: "0x4Dd733cBAcF4A13bD265CCB17B026BD9CdDBb0B0" as Address,
 } as const;
 
-/// The first BOT Chain deployment, kept only so the readiness check can refuse it by
-/// name. It predates the hardening — no dispute-timeout backstop, no neutral resolution,
-/// no deferred payouts — so it must never be the target of a funded session, even if a
-/// stale environment variable points there.
+/// The first BOT Chain *testnet* deployment, kept only so the readiness check can refuse it
+/// by name. It predates the hardening — no dispute-timeout backstop, no neutral resolution,
+/// no deferred payouts — so it must never be the target of a funded session, even if a stale
+/// environment variable points there.
+///
+/// Confusing coincidence worth knowing: the mainnet deployment carries this same address.
+/// Contract addresses derive from deployer and nonce, and the deployer began at nonce zero on
+/// both chains, so mainnet reproduced the testnet sequence exactly. They are different chains
+/// running different bytecode — mainnet has the hardened contracts — and this app only ever
+/// talks to testnet, so the guard below is only ever evaluated against chain 968. Should the
+/// app ever be pointed at mainnet, it would refuse to write; that is the safe direction to
+/// fail, but the stated reason would be wrong.
 export const LEGACY_JOB_ESCROW = "0x627853Ddf094172913f23366839A86DF3d1Aa5bB" as Address;

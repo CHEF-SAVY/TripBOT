@@ -65,7 +65,7 @@ export async function redeemDelivery(sellerKey: SellerKey, jobId: bigint, signat
     job_key: `${envAddress("JOB_ESCROW_ADDRESS").toLowerCase()}:${jobId}`,
     job_id: jobId.toString(),
     escrow_address: envAddress("JOB_ESCROW_ADDRESS"),
-    endpoint: seller.endpoint,
+    endpoint: seller.service,
     buyer: job.buyer,
   });
   if (!claimed) throw new Error("Delivery was already redeemed or durable storage is unavailable");

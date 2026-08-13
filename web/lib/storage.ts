@@ -1,6 +1,19 @@
 import "server-only";
 
+import { Agent, request as undiciRequest } from "undici";
+
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+
+/// Storage goes through undici directly for the same reason chain access does: Next's patched
+/// global fetch does not reuse the connection pool, so every call re-paid a TLS handshake and
+/// then died on undici's ten-second connect timeout. Keeping one keep-alive pool turns that
+/// into a single handshake for the life of the process.
+const storageAgent = new Agent({
+  connect: { timeout: 20_000 },
+  keepAliveTimeout: 60_000,
+  keepAliveMaxTimeout: 300_000,
+  connections: 6,
+});
 
 function config() {
   const url = process.env.SUPABASE_URL;
@@ -13,33 +26,37 @@ function config() {
   return { base: parsed.toString().replace(/\/$/, ""), key };
 }
 
-async function request<T>(path: string, init: RequestInit): Promise<T> {
+type StorageInit = { method: string; body?: string; headers?: Record<string, string> };
+
+async function request<T>(path: string, init: StorageInit): Promise<T> {
   const { base, key } = config();
-  const response = await fetch(`${base}/rest/v1/${path}`, {
-    ...init,
-    cache: "no-store",
+  const response = await undiciRequest(`${base}/rest/v1/${path}`, {
+    method: init.method as "GET" | "POST" | "PATCH" | "DELETE",
+    body: init.body,
     headers: {
       apikey: key,
       authorization: `Bearer ${key}`,
       "content-type": "application/json",
       ...init.headers,
     },
-    // Generous enough to absorb a cold connection and a PostgREST schema-cache reload,
-    // both of which land on the first visitor after a deploy and were measured at 6-15s.
-    // Still far below the routes' maxDuration, so a genuinely hung call fails the request
-    // rather than the whole function invocation.
-    signal: AbortSignal.timeout(15_000),
+    dispatcher: storageAgent,
+    // Generous enough to absorb a cold connection and a PostgREST schema-cache reload, both
+    // of which land on the first visitor after a deploy and were measured at 6-15s. Still
+    // well below the routes' maxDuration, so a genuinely hung call fails the request rather
+    // than the whole invocation.
+    headersTimeout: 15_000,
+    bodyTimeout: 15_000,
   });
-  if (!response.ok) {
-    const body = (await response.text()).slice(0, 500);
-    console.error("Demo storage request failed", response.status, body);
+  if (response.statusCode >= 400) {
+    const body = (await response.body.text()).slice(0, 500);
+    console.error("Demo storage request failed", response.statusCode, body);
     throw new Error("Durable demo storage operation failed");
   }
   // Writes ask for `Prefer: return=minimal`, which PostgREST answers with 201 and an empty
   // body rather than 204, so status alone is not a reliable test for "nothing to parse".
   // Reading the body first and only parsing when it is non-empty covers both, and stops a
   // successful insert from surfacing as a JSON syntax error.
-  const text = await response.text();
+  const text = await response.body.text();
   if (!text) return undefined as T;
   return JSON.parse(text) as T;
 }

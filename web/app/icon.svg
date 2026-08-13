@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="TripBOT">
+  <rect width="64" height="64" rx="14" fill="#080b0a"/>
+  <circle cx="11" cy="32" r="5.4" fill="#a9f4ee"/>
+  <circle cx="53" cy="32" r="5.4" fill="#a9f4ee"/>
+  <path d="M16.4 32h9.4M38.2 32h9.4" stroke="#a9f4ee" stroke-width="3.6" stroke-linecap="round"/>
+  <path d="M33.4 15.5 25.6 33.2h5.2L28.9 48.5l9.9-18.3h-5.3z" fill="#a9f4ee"/>
+</svg>
