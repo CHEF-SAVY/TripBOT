@@ -295,8 +295,18 @@ export function BuyerSession() {
       </nav>
 
       <section className="lp-stage" aria-live="polite">
-        {!state.data?.writeEnabled && (
+        {/* Only claim read-only once the chain has actually answered. Keyed off the absence of
+            data, this announced "no transaction can be sent" to every visitor for as long as
+            the first read took — six seconds on a cold instance — which was never true and was
+            the first thing anyone saw. */}
+        {!state.data && !state.error && (
+          <p className="lp-loading">Reading live state from BOT Chain…</p>
+        )}
+        {state.data && !state.data.writeEnabled && (
           <p className="lp-note">Read-only safety mode. The chain state below is real; no transaction can be sent.</p>
+        )}
+        {!state.data && state.error && (
+          <p className="lp-note">BOT Chain is slow to answer right now. The page will fill in as soon as it does.</p>
         )}
 
         {visualPhase === "choose" && (

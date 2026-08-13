@@ -466,3 +466,10 @@ button:focus-visible, a:focus-visible { outline: 2px solid var(--lime); outline-
 /* The entry points and the chain facts, moved out of the hero so the first screen carries
    only the name and what it does. */
 .hero-follow { padding: 0 0 84px; display: grid; gap: 34px; }
+.lp-loading { margin: 0 0 22px; padding: 13px 16px; display: flex; align-items: center; gap: 10px;
+  border: 1px solid var(--hair, rgba(255,255,255,.07)); border-radius: 10px; color: var(--muted);
+  font-size: 12px; }
+.lp-loading::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--cyan);
+  animation: lp-pulse 1.4s ease-in-out infinite; }
+@keyframes lp-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .lp-loading::before { animation: none; opacity: .7; } }
