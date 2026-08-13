@@ -2,7 +2,7 @@ import "server-only";
 
 import { isAddress, type Address, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { BOT_TESTNET_DEPLOYMENT } from "../deployments";
+import { LEGACY_JOB_ESCROW } from "../deployments";
 
 type Readiness = { ready: boolean; reason: string | null };
 
@@ -24,8 +24,8 @@ export function assertDemoWriteReady(): void {
   if (process.env.DEMO_WRITE_ENABLED !== "true") throw new Error("Demo writes are disabled");
   const escrow = process.env.JOB_ESCROW_ADDRESS;
   if (!escrow || !isAddress(escrow)) throw new Error("JOB_ESCROW_ADDRESS is not configured");
-  if (escrow.toLowerCase() === BOT_TESTNET_DEPLOYMENT.jobEscrow.toLowerCase()) {
-    throw new Error("The legacy deployment is read-only; deploy the hardened contracts first");
+  if (escrow.toLowerCase() === LEGACY_JOB_ESCROW.toLowerCase()) {
+    throw new Error("The legacy deployment is read-only; point at the hardened contracts");
   }
   if (!process.env.SESSION_SECRET || Buffer.byteLength(process.env.SESSION_SECRET) < 32) {
     throw new Error("SESSION_SECRET must contain at least 32 bytes");
