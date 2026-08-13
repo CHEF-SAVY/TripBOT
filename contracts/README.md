@@ -1,6 +1,6 @@
-# Tripwire contracts
+# TripBOT contracts
 
-Foundry project for Tripwire's escrow stack, ported from Circle's Arc testnet to BOT Chain
+Foundry project for TripBOT's escrow stack, ported from Circle's Arc testnet to BOT Chain
 testnet:
 
 - **`SellerBond.sol`** — slashable native-BOT stake keyed by ERC-8004 agentId. Sellers post
@@ -12,7 +12,7 @@ testnet:
 - **`registries/IdentityRegistry.sol`** and **`registries/ValidationRegistry.sol`** — minimal
   ERC-8004 stand-ins deployed alongside the two contracts above. No ERC-8004 registry exists
   on BOT Chain testnet (confirmed against `scan.bohr.life`'s own search API before writing
-  these), so this project deploys its own, scoped only to the calls Tripwire actually makes.
+  these), so this project deploys its own, scoped only to the calls TripBOT actually makes.
 
 Both `SellerBond.sol` and `JobEscrow.sol` are complete, fully unit-tested, and were
 previously deployed and verified on Arc testnet before this port.
@@ -49,20 +49,33 @@ at `0x3600...0000`. Every escrowed/staked amount here is plain native value (`ms
 Mainnet (chain ID `677`, `https://rpc.botchain.ai`) is deliberately not configured — this
 project is testnet-only.
 
-Deployed and verified on `scan.bohr.life`:
+Current deployment on `scan.bohr.life`:
 
 ```
-IdentityRegistry:   0x9e0F863AE8165688c6e5Ec335236bD459f2DdC8b
-ValidationRegistry: 0xA29b9F92Eb6A64B9371F86f80e458743341c6c9F
-JobEscrow:          0x627853Ddf094172913f23366839A86DF3d1Aa5bB
-SellerBond:         0x3A40b1dd835f271e2E67C5b2AEb82F27D4d5ec5D
+IdentityRegistry:   0x66677c64d0545a5F161EAE83fed8D260EAc58cAa
+ValidationRegistry: 0x4Dd733cBAcF4A13bD265CCB17B026BD9CdDBb0B0
+JobEscrow:          0xe02695454edA18Ec0b00836F98635aC2D6CAA238
+SellerBond:         0x56641c18259bDf08dF4b78d14Bb7ECe3a2283A67
 Arbiter/Owner:      0xC9DF311Af34f6a9cD1A406776F5F88798Fe615a6
 ```
 
-Full lifecycle sanity-checked on-chain post-deploy: seller registered (agentId 0), bond
-posted, then all three exit paths exercised end to end — `createJob` → `release`,
-`createJob` → `dispute` → `resolveDispute` (seller-at-fault slash), and `createJob` →
-`claimTimeout`.
+This stack carries the hardened contracts: a dispute-timeout backstop for an absent arbiter,
+neutral resolution for a proven infrastructure failure, deferred pull payouts so a rejecting
+recipient cannot block settlement, reentrancy guards on every value-moving path, rounded-up
+collateral, pausable job creation, and two-step owner/arbiter rotation.
+
+An earlier deployment (JobEscrow `0x627853Ddf094172913f23366839A86DF3d1Aa5bB`) predates that
+work and is deliberately superseded. It remains readable on the explorer as the record of the
+original port; the app refuses to write to it.
+
+Sanity-checked on-chain post-deploy. Three seller agents (ids 0-2) are registered and bonded
+at 0.15 BOT each, and the dispute path has been exercised end to end through the app:
+`validationRequest` → `createJob` → `dispute` → `resolveDispute`, with the seller's collateral
+verifiably moving 0.150 → 0.144 BOT and the buyer receiving both the escrow refund and the
+slashed bond.
+
+All three exit paths — `release`, `dispute` → `resolveDispute`, and `claimTimeout` — were
+additionally exercised end to end against the earlier deployment during the original port.
 
 ## Get test BOT
 
